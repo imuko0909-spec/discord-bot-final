@@ -1,0 +1,268 @@
+import discord
+from discord import app_commands
+from discord.ext import commands
+import asyncio
+import os
+
+MY_USER_ID = 1232865763094827112
+
+RECEPTION_CHANNEL_ID = 1521453980268498974
+
+intents = discord.Intents.default()
+intents.members = True
+intents.voice_states = True
+
+user_lists = {"favorites": [], "blacklist": []}
+
+rooms = {}
+
+
+class MyListBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        self.add_view(CreateVCView())
+        synced = await self.tree.sync()
+        print(f"{len(synced)} 件のコマンドを同期しました。")
+
+    async def on_ready(self):
+        print(f"✅ {self.user} でログイン完了。")
+
+
+bot = MyListBot()
+
+
+class ActionView(discord.ui.View):
+    def __init__(self, target_member: discord.Member):
+        super().__init__(timeout=60)
+        self.target = target_member
+
+    @discord.ui.button(label="❤️ お気に入り追加", style=discord.ButtonStyle.green)
+    async def add_fav(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = self.target.id
+        if uid not in user_lists["favorites"]:
+            user_lists["favorites"].append(uid)
+            await interaction.response.send_message(
+                f"{self.target.display_name} をお気に入りに入れました。", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"{self.target.display_name} はすでにお気に入りに登録済みです。", ephemeral=True
+            )
+
+    @discord.ui.button(label="💔 お気に入り解除", style=discord.ButtonStyle.secondary)
+    async def remove_fav(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = self.target.id
+        if uid in user_lists["favorites"]:
+            user_lists["favorites"].remove(uid)
+            await interaction.response.send_message(
+                f"{self.target.display_name} をお気に入りから解除しました。", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"{self.target.display_name} はお気に入りに登録されていません。", ephemeral=True
+            )
+
+    @discord.ui.button(label="🚫 BL追加", style=discord.ButtonStyle.danger)
+    async def add_bl(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = self.target.id
+        if uid not in user_lists["blacklist"]:
+            user_lists["blacklist"].append(uid)
+            await interaction.response.send_message(
+                f"{self.target.display_name} をブラックリストに入れました。", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"{self.target.display_name} はすでにブラックリストに登録済みです。", ephemeral=True
+            )
+
+
+class SelectMemberView(discord.ui.View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=60)
+        options = [
+            discord.SelectOption(label=m.display_name[:100], value=str(m.id))
+            for m in guild.members if not m.bot and m.id != MY_USER_ID
+        ][:25]
+        self.add_item(self.MemberSelect(options))
+
+    class MemberSelect(discord.ui.Select):
+        def __init__(self, options):
+            if not options:
+                options = [discord.SelectOption(label="（対象メンバーがいません）", value="none")]
+            super().__init__(placeholder="メンバーを選択してください...", options=options)
+
+        async def callback(self, interaction: discord.Interaction):
+            if self.values[0] == "none":
+                await interaction.response.send_message(
+                    "操作できるメンバーがいません。", ephemeral=True
+                )
+                return
+            target_id = int(self.values[0])
+            target_member = interaction.guild.get_member(target_id)
+            await interaction.response.send_message(
+                f"{target_member.display_name} を選択しました。操作を選んでください。",
+                view=ActionView(target_member),
+                ephemeral=True
+            )
+
+
+@bot.tree.command(name="mylist", description="マイリスト管理メニューを開く")
+async def mylist(interaction: discord.Interaction):
+    if interaction.user.id != MY_USER_ID:
+        return await interaction.response.send_message("権限がありません。", ephemeral=True)
+    if interaction.guild is None:
+        return await interaction.response.send_message(
+            "このコマンドはサーバー内でのみ使用できます。", ephemeral=True
+        )
+    await interaction.response.send_message(
+        "メンバーを選択：", view=SelectMemberView(interaction.guild), ephemeral=True
+    )
+
+
+@bot.tree.context_menu(name="マイリスト管理")
+async def mylist_menu(interaction: discord.Interaction, member: discord.Member):
+    if interaction.user.id != MY_USER_ID:
+        return await interaction.response.send_message(
+            "あなたはこの機能を使えません。", ephemeral=True
+        )
+
+    in_fav = member.id in user_lists["favorites"]
+    in_bl = member.id in user_lists["blacklist"]
+    status = []
+    if in_fav:
+        status.append("⭐ お気に入り登録済み")
+    if in_bl:
+        status.append("🚫 ブラックリスト登録済み")
+    status_text = "　".join(status) if status else "未登録"
+
+    await interaction.response.send_message(
+        f"**{member.display_name}** さんの管理操作を選択してください：\n現在のステータス: {status_text}",
+        view=ActionView(member),
+        ephemeral=True
+    )
+
+
+class ExtendButton(discord.ui.View):
+    def __init__(self, channel: discord.VoiceChannel):
+        super().__init__(timeout=None)
+        self.channel = channel
+
+    @discord.ui.button(label="10分延長", style=discord.ButtonStyle.primary)
+    async def extend(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.channel.id in rooms:
+            rooms[self.channel.id] += 600
+            await interaction.response.send_message(
+                f"10分延長しました！（残り {rooms[self.channel.id] // 60}分）", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "この部屋はすでに存在しません。", ephemeral=True
+            )
+
+
+async def manage_room_timer(channel: discord.VoiceChannel):
+    """個室のタイマー管理ループ"""
+    while rooms.get(channel.id, 0) > 0:
+        await asyncio.sleep(60)
+        if channel.id not in rooms:
+            return
+        rooms[channel.id] -= 60
+
+        if rooms[channel.id] > 0:
+            try:
+                await channel.send(f"残り時間: {rooms[channel.id] // 60}分")
+            except discord.HTTPException:
+                pass
+        else:
+            try:
+                await channel.send("時間終了です。部屋を削除します。")
+                await channel.delete()
+            except discord.HTTPException:
+                pass
+            rooms.pop(channel.id, None)
+            break
+
+
+async def create_private_room(guild: discord.Guild, member: discord.Member,
+                              category: discord.CategoryChannel = None) -> discord.VoiceChannel:
+    """個室VCを作成し、タイマーと延長ボタンを設定する"""
+    new_channel = await guild.create_voice_channel(
+        name=f"{member.display_name}の個室",
+        category=category
+    )
+    rooms[new_channel.id] = 600
+    await new_channel.send(
+        "個室へようこそ！10分後に削除されます。", view=ExtendButton(new_channel)
+    )
+    bot.loop.create_task(manage_room_timer(new_channel))
+    return new_channel
+
+
+class CreateVCView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="🎤 VC作成", style=discord.ButtonStyle.success, custom_id="create_vc_button"
+    )
+    async def create_vc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        member = interaction.user
+        category = interaction.channel.category if interaction.channel else None
+        new_channel = await create_private_room(interaction.guild, member, category)
+
+        if member.voice and member.voice.channel:
+            try:
+                await member.move_to(new_channel)
+                await interaction.response.send_message(
+                    f"{new_channel.mention} を作成し、移動しました！", ephemeral=True
+                )
+                return
+            except discord.HTTPException:
+                pass
+        await interaction.response.send_message(
+            f"{new_channel.mention} を作成しました！参加してください。", ephemeral=True
+        )
+
+
+@bot.tree.command(name="vcpanel", description="VC作成パネルを設置する")
+async def vcpanel(interaction: discord.Interaction):
+    if interaction.user.id != MY_USER_ID:
+        return await interaction.response.send_message("権限がありません。", ephemeral=True)
+    if interaction.guild is None:
+        return await interaction.response.send_message(
+            "このコマンドはサーバー内でのみ使用できます。", ephemeral=True
+        )
+    await interaction.response.send_message(
+        "ボタンを押すと個室VCが作成されます！（10分後に自動削除・延長可能）",
+        view=CreateVCView()
+    )
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if (
+        RECEPTION_CHANNEL_ID
+        and after.channel
+        and after.channel.id == RECEPTION_CHANNEL_ID
+    ):
+        new_channel = await create_private_room(
+            after.channel.guild, member, after.channel.category
+        )
+        await member.move_to(new_channel)
+
+    if before.channel and before.channel.id in rooms:
+        if len(before.channel.members) == 0:
+            try:
+                await before.channel.delete()
+            except discord.HTTPException:
+                pass
+            rooms.pop(before.channel.id, None)
+
+
+TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("DISCORD_BOT_TOKEN が設定されていません。")
+
+bot.run(TOKEN)
