@@ -69,6 +69,15 @@ def remove_from_list(owner_id: int, list_type: str, target_id: int) -> bool:
     return cur.rowcount > 0
 
 
+def get_list(owner_id: int, list_type: str) -> list:
+    """指定リストに登録された target_id を全部返す"""
+    cur = db.execute(
+        "SELECT target_id FROM user_lists WHERE owner_id=? AND list_type=?",
+        (owner_id, list_type),
+    )
+    return [row[0] for row in cur.fetchall()]
+
+
 init_db()
 
 
@@ -239,6 +248,45 @@ async def mylist_menu(interaction: discord.Interaction, member: discord.Member):
         view=ActionView(member),
         ephemeral=True
     )
+
+
+@bot.tree.command(name="mylist_view", description="自分のお気に入り・ブラックリストの一覧を見る")
+async def mylist_view(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message(
+            "このコマンドはサーバー内でのみ使用できます。", ephemeral=True
+        )
+    try:
+        fav_ids = get_list(interaction.user.id, "favorites")
+        bl_ids = get_list(interaction.user.id, "blacklist")
+    except sqlite3.Error:
+        return await interaction.response.send_message(DB_ERROR_MSG, ephemeral=True)
+
+    def format_names(ids):
+        if not ids:
+            return "（なし）"
+        lines = []
+        for tid in ids:
+            m = interaction.guild.get_member(tid)
+            name = m.display_name if m else f"退出したユーザー（ID: {tid}）"
+            lines.append(f"・{name}")
+        text = "\n".join(lines)
+        if len(text) > 1024:
+            text = text[:1000] + "\n…（省略）"
+        return text
+
+    embed = discord.Embed(title="📋 あなたのマイリスト", color=discord.Color.blurple())
+    embed.add_field(
+        name=f"❤️ お気に入り（{len(fav_ids)}人）",
+        value=format_names(fav_ids),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"🚫 ブラックリスト（{len(bl_ids)}人）",
+        value=format_names(bl_ids),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class ExtendButton(discord.ui.View):
