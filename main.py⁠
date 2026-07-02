@@ -289,6 +289,92 @@ async def mylist_view(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+class ApplicationView(discord.ui.View):
+    """立候補ボタンを表示するビュー"""
+    def __init__(self, author_id: int):
+        super().__init__(timeout=None)
+        self.author_id = author_id
+
+    @discord.ui.button(label="立候補する", style=discord.ButtonStyle.green)
+    async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id == self.author_id:
+            return await interaction.response.send_message(
+                "自分の募集には立候補できません。", ephemeral=True
+            )
+        try:
+            author = await bot.fetch_user(self.author_id)
+            await author.send(
+                f"📩 {interaction.user.display_name} さんから立候補がありました！"
+            )
+            await interaction.response.send_message("立候補を送信しました！", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "募集主にDMが送れませんでした（DM設定を確認してください）。", ephemeral=True
+            )
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "送信に失敗しました。しばらくしてからもう一度お試しください。", ephemeral=True
+            )
+
+
+class NotifyView(discord.ui.View):
+    """男性/女性/両方宛のボタン"""
+    def __init__(self, author_id: int):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+
+    async def send_notification(self, interaction: discord.Interaction, target: str):
+        embed = discord.Embed(
+            title="📢 募集通知",
+            description=f"{target}の方、立候補をお待ちしています！",
+            color=discord.Color.green(),
+        )
+        embed.set_footer(text=f"募集主: {interaction.user.display_name}")
+        view = ApplicationView(self.author_id)
+
+        channel = discord.utils.get(interaction.guild.text_channels, name="なう募集")
+        if channel is None:
+            return await interaction.response.send_message(
+                "「なう募集」チャンネルが見つかりません。", ephemeral=True
+            )
+        try:
+            await channel.send(embed=embed, view=view)
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                "「なう募集」チャンネルに送信する権限がありません。", ephemeral=True
+            )
+        except discord.HTTPException:
+            return await interaction.response.send_message(
+                "通知の送信に失敗しました。しばらくしてからもう一度お試しください。", ephemeral=True
+            )
+        await interaction.response.send_message(f"{target}へ通知しました！", ephemeral=True)
+
+    @discord.ui.button(label="男性宛", style=discord.ButtonStyle.primary)
+    async def men(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.send_notification(interaction, "男性")
+
+    @discord.ui.button(label="女性宛", style=discord.ButtonStyle.primary)
+    async def women(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.send_notification(interaction, "女性")
+
+    @discord.ui.button(label="両方宛", style=discord.ButtonStyle.secondary)
+    async def both(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.send_notification(interaction, "男性・女性")
+
+
+@bot.tree.command(name="募集", description="なう募集の通知を送る（宛先を選べます）")
+async def bosyu(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message(
+            "このコマンドはサーバー内でのみ使用できます。", ephemeral=True
+        )
+    await interaction.response.send_message(
+        "募集の種類を選択してください：",
+        view=NotifyView(interaction.user.id),
+        ephemeral=True
+    )
+
+
 class ExtendButton(discord.ui.View):
     def __init__(self, channel: discord.VoiceChannel):
         super().__init__(timeout=None)
