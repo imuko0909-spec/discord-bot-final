@@ -516,3 +516,79 @@ if not TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN が設定されていません。")
 
 bot.run(TOKEN)
+
+# 1. 部屋の種類を選択するメニュー
+class SelectRoomTypeView(discord.ui.View):
+    def __init__(self, category):
+        super().__init__(timeout=60)
+        self.category = category
+
+    @discord.ui.button(label="🔑 ノック部屋を作成", style=discord.ButtonStyle.secondary)
+    async def knock_room(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # ノック部屋作成（@everyoneを拒否して作成）
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(connect=False),
+            interaction.user: discord.PermissionOverwrite(connect=True, manage_channels=True)
+        }
+        channel = await interaction.guild.create_voice_channel(
+            name=f"🔐{interaction.user.display_name}のノック部屋",
+            category=self.category,
+            overwrites=overwrites
+        )
+        await channel.send(f"{interaction.user.mention} さんのノック部屋です。入室希望者がノックすると通知が来ます。", 
+                           view=KnockButtonView(interaction.user.id))
+        await interaction.response.send_message(f"ノック部屋を作成しました: {channel.mention}", ephemeral=True)
+
+    @discord.ui.button(label="🔓 貸切(フリー)部屋を作成", style=discord.ButtonStyle.success)
+    async def free_room(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 既存のcreate_private_roomを流用
+        new_channel = await create_private_room(interaction.guild, interaction.user, self.category)
+        await interaction.response.send_message(f"貸切部屋を作成しました: {new_channel.mention}", ephemeral=True)
+
+# 2. ノックボタン（部屋内に配置）
+class KnockButtonView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=None)
+        self.owner_id = owner_id
+
+    @discord.ui.button(label="🚪 ノックする", style=discord.ButtonStyle.primary, custom_id="knock_btn")
+    async def knock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        owner = interaction.guild.get_member(self.owner_id)
+        if not owner:
+            return await interaction.response.send_message("オーナーが見つかりません。", ephemeral=True)
+        
+        await interaction.response.send_message("オーナーに通知しました。", ephemeral=True)
+        await owner.send(f"{interaction.user.mention} があなたの部屋に入りたがっています！", 
+                         view=ApproveView(interaction.user.id, interaction.channel.id))
+
+# 3. 承認ボタン（オーナーへのDM）
+class ApproveView(discord.ui.View):
+    def __init__(self, guest_id: int, channel_id: int):
+        super().__init__(timeout=60)
+        self.guest_id = guest_id
+        self.channel_id = channel_id
+
+    @discord.ui.button(label="✅ 承認", style=discord.ButtonStyle.green)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.client.get_channel(self.channel_id)
+        if channel:
+            # ゲストに接続権限を付与
+            await channel.set_permissions(interaction.guild.get_member(self.guest_id), connect=True)
+            await interaction.response.send_message("承認しました！")
+        else:
+            await interaction.response.send_message("部屋が見つかりません。")
+
+class CreateVCView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎤 部屋を作成する", style=discord.ButtonStyle.success, custom_id="create_vc_button")
+    async def create_vc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        category = interaction.channel.category if interaction.channel else None
+        await interaction.response.send_message(
+            "作成する部屋のタイプを選んでください。",
+            view=SelectRoomTypeView(category),
+            ephemeral=True
+        )
+
+
