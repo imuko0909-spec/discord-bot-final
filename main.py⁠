@@ -16,6 +16,7 @@ RECEPTION_CHANNEL_ID = 1521453980268498974
 
 KNOCK_TEXT_CHANNEL_NAME = "ノック"
 RECRUIT_CHANNEL_NAME = "なう募集"
+ADMIN_LOG_CHANNEL_NAME = "管理ログ"
 
 ROOM_TIME = 600  # 10分
 
@@ -268,6 +269,92 @@ async def get_or_create_knock_text_channel(guild: discord.Guild):
     )
 
 
+
+async def get_or_create_admin_log_channel(guild: discord.Guild):
+    channel = discord.utils.get(guild.text_channels, name=ADMIN_LOG_CHANNEL_NAME)
+    if channel:
+        return channel
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=False
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_channels=True,
+            read_message_history=True
+        )
+    }
+
+    return await guild.create_text_channel(
+        ADMIN_LOG_CHANNEL_NAME,
+        overwrites=overwrites
+    )
+
+
+async def send_admin_log(guild: discord.Guild, embed: discord.Embed):
+    try:
+        channel = await get_or_create_admin_log_channel(guild)
+        await channel.send(embed=embed)
+    except discord.Forbidden:
+        print("管理ログチャンネルの作成または送信権限がありません。")
+    except discord.HTTPException:
+        traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
+
+
+async def log_room_created(guild: discord.Guild, member: discord.Member, channel: discord.VoiceChannel, room_type: str):
+    room_type_text = "🔐 ノック部屋" if room_type == "knock" else "🔓 貸切部屋"
+
+    embed = discord.Embed(
+        title="🟢 部屋作成ログ",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="部屋タイプ", value=room_type_text, inline=True)
+    embed.add_field(name="部屋主", value=f"{member.mention}\nID: `{member.id}`", inline=True)
+    embed.add_field(name="部屋", value=f"{channel.mention}\n`{channel.name}`", inline=False)
+    embed.add_field(name="サーバー", value=guild.name, inline=False)
+    embed.timestamp = discord.utils.utcnow()
+
+    await send_admin_log(guild, embed)
+
+
+async def log_room_deleted(guild: discord.Guild, room: dict | None, channel_name: str | None, reason: str):
+    if not room:
+        return
+
+    owner = guild.get_member(room.get("owner_id"))
+    room_type = room.get("type")
+    room_type_text = "🔐 ノック部屋" if room_type == "knock" else "🔓 貸切部屋"
+
+    log_id = room.get("log_id")
+    duration_text = "不明"
+
+    if log_id:
+        cur = db.execute("SELECT created_at FROM room_logs WHERE id=?", (log_id,))
+        row = cur.fetchone()
+        if row:
+            duration_text = format_seconds(max(0, int(time.time()) - row[0]))
+
+    embed = discord.Embed(
+        title="🔴 部屋終了ログ",
+        color=discord.Color.red()
+    )
+    embed.add_field(name="終了理由", value=reason, inline=True)
+    embed.add_field(name="部屋タイプ", value=room_type_text, inline=True)
+    embed.add_field(
+        name="部屋主",
+        value=f"{owner.mention if owner else '退出済みユーザー'}\nID: `{room.get('owner_id')}`",
+        inline=False
+    )
+    embed.add_field(name="部屋名", value=f"`{channel_name or '不明'}`", inline=False)
+    embed.add_field(name="利用時間", value=duration_text, inline=True)
+    embed.timestamp = discord.utils.utcnow()
+
+    await send_admin_log(guild, embed)
+
 def is_room_owner(user_id: int, channel_id: int):
     room = rooms.get(channel_id)
     return room and room["owner_id"] == user_id
@@ -279,10 +366,14 @@ def get_room_guild_and_channel(guild_id: int, channel_id: int):
     return guild, channel
 
 
-async def delete_room(channel_id: int, guild: discord.Guild):
+async def delete_room(channel_id: int, guild: discord.Guild, reason: str = "不明"):
     room = rooms.get(channel_id)
+    channel_for_log = guild.get_channel(channel_id)
+    channel_name_for_log = channel_for_log.name if channel_for_log else None
 
     if room:
+        await log_room_deleted(guild, room, channel_name_for_log, reason)
+
         text_channel_id = room.get("knock_text_channel_id")
         message_ids = room.get("message_ids", [])
         text_ch = guild.get_channel(text_channel_id) if text_channel_id else None
@@ -726,7 +817,7 @@ class RoomManageView(discord.ui.View):
         if not await self.owner_check(interaction):
             return
         await safe_reply(interaction, "部屋を削除します。")
-        await delete_room(self.channel_id, interaction.guild)
+        await delete_room(self.channel_id, interaction.guild, reason="部屋主が削除ボタンを押しました")
 
 
 # =========================================================
@@ -743,7 +834,7 @@ async def room_timer(channel_id, guild):
         rooms[channel_id]["time"] -= 60
 
         if rooms[channel_id]["time"] <= 0:
-            await delete_room(channel_id, guild)
+            await delete_room(channel_id, guild, reason="時間切れによる自動削除")
             return
 
 
@@ -795,6 +886,7 @@ async def create_free_room(guild, member, category):
     rooms[channel.id]["message_ids"] = [msg.id]
 
     bot.loop.create_task(room_timer(channel.id, guild))
+    await log_room_created(guild, member, channel, "free")
     return channel
 
 
@@ -851,6 +943,7 @@ async def create_knock_room(guild, member, category):
     rooms[channel.id]["message_ids"] = [manage_msg.id]
 
     bot.loop.create_task(room_timer(channel.id, guild))
+    await log_room_created(guild, member, channel, "knock")
     return channel
 
 
@@ -1145,7 +1238,7 @@ async def on_voice_state_update(member, before, after):
 
     if before.channel and before.channel.id in rooms:
         if len(before.channel.members) == 0:
-            await delete_room(before.channel.id, before.channel.guild)
+            await delete_room(before.channel.id, before.channel.guild, reason="空室になったため自動削除")
 
 
 bot.run(TOKEN)
