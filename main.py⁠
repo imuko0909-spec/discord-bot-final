@@ -4,18 +4,14 @@ from discord.ext import commands
 import asyncio
 import sqlite3
 import os
-
-# =========================
-# 設定
-# =========================
+import traceback
 
 MY_USER_ID = 1232865763094827112
 RECEPTION_CHANNEL_ID = 1521453980268498974
 
 KNOCK_TEXT_CHANNEL_NAME = "ノック"
 RECRUIT_CHANNEL_NAME = "なう募集"
-
-ROOM_TIME = 600  # 10分
+ROOM_TIME = 600
 
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 if not TOKEN:
@@ -31,10 +27,6 @@ rooms = {}
 DB_PATH = os.path.join(os.path.dirname(__file__), "bot_data.db")
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 
-
-# =========================
-# DB
-# =========================
 
 def init_db():
     db.execute("""
@@ -85,10 +77,6 @@ def get_list(owner_id, list_type):
 init_db()
 
 
-# =========================
-# Bot
-# =========================
-
 class MyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
@@ -105,8 +93,8 @@ class MyBot(commands.Bot):
                     synced = await self.tree.sync(guild=guild)
                     print(f"✅ {guild.name} に {len(synced)} 件同期しました。")
                 self.synced = True
-            except Exception as e:
-                print(f"❌ 同期エラー: {e}")
+            except Exception:
+                traceback.print_exc()
 
         print(f"✅ {self.user} でログイン完了")
 
@@ -120,25 +108,31 @@ async def on_guild_join(guild: discord.Guild):
         bot.tree.copy_global_to(guild=guild)
         synced = await bot.tree.sync(guild=guild)
         print(f"✅ 新規サーバー {guild.name} に {len(synced)} 件同期しました。")
-    except Exception as e:
-        print(f"❌ 新規サーバー同期エラー: {e}")
+    except Exception:
+        traceback.print_exc()
 
 
 @bot.tree.error
 async def on_app_command_error(interaction, error):
-    print(f"[エラー] {type(error).__name__}: {error}")
+    traceback.print_exception(type(error), error, error.__traceback__)
     try:
         if interaction.response.is_done():
             await interaction.followup.send("エラーが発生しました。", ephemeral=True)
         else:
             await interaction.response.send_message("エラーが発生しました。", ephemeral=True)
-    except:
+    except Exception:
         pass
 
 
-# =========================
-# 共通
-# =========================
+async def safe_reply(interaction, content, ephemeral=True):
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+    except Exception:
+        traceback.print_exc()
+
 
 async def get_or_create_knock_text_channel(guild: discord.Guild):
     channel = discord.utils.get(guild.text_channels, name=KNOCK_TEXT_CHANNEL_NAME)
@@ -173,28 +167,37 @@ def is_room_owner(user_id: int, channel_id: int):
 async def delete_room(channel_id: int, guild: discord.Guild):
     room = rooms.get(channel_id)
 
+    if room:
+        text_channel_id = room.get("knock_text_channel_id")
+        message_ids = room.get("message_ids", [])
+
+        text_ch = guild.get_channel(text_channel_id) if text_channel_id else None
+
+        if text_ch:
+            for msg_id in message_ids:
+                try:
+                    msg = await text_ch.fetch_message(msg_id)
+                    await msg.delete()
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException:
+                    pass
+                except Exception:
+                    traceback.print_exc()
+
     channel = guild.get_channel(channel_id)
     if channel:
         try:
             await channel.delete()
-        except:
+        except discord.NotFound:
             pass
-
-    if room and room.get("knock_message_id") and room.get("knock_text_channel_id"):
-        text_ch = guild.get_channel(room["knock_text_channel_id"])
-        if text_ch:
-            try:
-                msg = await text_ch.fetch_message(room["knock_message_id"])
-                await msg.delete()
-            except:
-                pass
+        except discord.HTTPException:
+            pass
+        except Exception:
+            traceback.print_exc()
 
     rooms.pop(channel_id, None)
 
-
-# =========================
-# マイリスト
-# =========================
 
 class ActionView(discord.ui.View):
     def __init__(self, target):
@@ -204,34 +207,22 @@ class ActionView(discord.ui.View):
     @discord.ui.button(label="❤️ お気に入り追加", style=discord.ButtonStyle.green)
     async def fav_add(self, interaction, button):
         added = add_to_list(interaction.user.id, "favorites", self.target.id)
-        await interaction.response.send_message(
-            "お気に入りに追加しました。" if added else "すでにお気に入りです。",
-            ephemeral=True
-        )
+        await safe_reply(interaction, "お気に入りに追加しました。" if added else "すでにお気に入りです。")
 
     @discord.ui.button(label="💔 お気に入り解除", style=discord.ButtonStyle.secondary)
     async def fav_remove(self, interaction, button):
         removed = remove_from_list(interaction.user.id, "favorites", self.target.id)
-        await interaction.response.send_message(
-            "お気に入りから解除しました。" if removed else "お気に入りに入っていません。",
-            ephemeral=True
-        )
+        await safe_reply(interaction, "お気に入りから解除しました。" if removed else "お気に入りに入っていません。")
 
     @discord.ui.button(label="🚫 BL追加", style=discord.ButtonStyle.danger)
     async def bl_add(self, interaction, button):
         added = add_to_list(interaction.user.id, "blacklist", self.target.id)
-        await interaction.response.send_message(
-            "ブラックリストに追加しました。" if added else "すでにブラックリストです。",
-            ephemeral=True
-        )
+        await safe_reply(interaction, "ブラックリストに追加しました。" if added else "すでにブラックリストです。")
 
     @discord.ui.button(label="🚫 BL解除", style=discord.ButtonStyle.secondary)
     async def bl_remove(self, interaction, button):
         removed = remove_from_list(interaction.user.id, "blacklist", self.target.id)
-        await interaction.response.send_message(
-            "ブラックリストから解除しました。" if removed else "ブラックリストに入っていません。",
-            ephemeral=True
-        )
+        await safe_reply(interaction, "ブラックリストから解除しました。" if removed else "ブラックリストに入っていません。")
 
 
 class MemberSelect(discord.ui.Select):
@@ -240,9 +231,12 @@ class MemberSelect(discord.ui.Select):
 
     async def callback(self, interaction):
         if self.values[0] == "none":
-            return await interaction.response.send_message("対象メンバーがいません。", ephemeral=True)
+            return await safe_reply(interaction, "対象メンバーがいません。")
 
         member = interaction.guild.get_member(int(self.values[0]))
+        if not member:
+            return await safe_reply(interaction, "メンバーが見つかりません。")
+
         await interaction.response.send_message(
             f"{member.display_name} さんの操作を選んでください。",
             view=ActionView(member),
@@ -268,6 +262,9 @@ class SelectMemberView(discord.ui.View):
 
 @bot.tree.command(name="mylist", description="お気に入り・ブラックリストを管理")
 async def mylist(interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
     await interaction.response.send_message(
         "メンバーを選んでください。",
         view=SelectMemberView(interaction.guild, interaction.user.id),
@@ -277,6 +274,9 @@ async def mylist(interaction):
 
 @bot.tree.command(name="mylist_view", description="自分のマイリストを見る")
 async def mylist_view(interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
     fav = get_list(interaction.user.id, "favorites")
     bl = get_list(interaction.user.id, "blacklist")
 
@@ -305,10 +305,6 @@ async def mylist_menu(interaction, member: discord.Member):
     )
 
 
-# =========================
-# ノック機能
-# =========================
-
 class KnockDecisionView(discord.ui.View):
     def __init__(self, channel_id, requester_id):
         super().__init__(timeout=180)
@@ -317,47 +313,50 @@ class KnockDecisionView(discord.ui.View):
 
     @discord.ui.button(label="✅ 許可", style=discord.ButtonStyle.success)
     async def allow(self, interaction, button):
-        room = rooms.get(self.channel_id)
-        if not room:
-            return await interaction.response.send_message("部屋がありません。", ephemeral=True)
-
-        if interaction.user.id != room["owner_id"]:
-            return await interaction.response.send_message("部屋主だけ操作できます。", ephemeral=True)
-
-        channel = interaction.guild.get_channel(self.channel_id)
-        member = interaction.guild.get_member(self.requester_id)
-
-        if not channel or not member:
-            return await interaction.response.send_message("対象が見つかりません。", ephemeral=True)
-
-        await channel.set_permissions(member, view_channel=True, connect=True, speak=True)
-
         try:
-            if member.voice and member.voice.channel:
-                await member.move_to(channel)
-        except:
-            pass
+            room = rooms.get(self.channel_id)
+            if not room:
+                return await safe_reply(interaction, "部屋がありません。")
 
-        await interaction.response.send_message(
-            f"✅ {member.display_name} さんを許可しました。",
-            ephemeral=True
-        )
+            if interaction.user.id != room["owner_id"] and interaction.user.id != MY_USER_ID:
+                return await safe_reply(interaction, "部屋主だけ操作できます。")
+
+            channel = interaction.guild.get_channel(self.channel_id)
+            member = interaction.guild.get_member(self.requester_id)
+
+            if not channel or not member:
+                return await safe_reply(interaction, "対象が見つかりません。")
+
+            await channel.set_permissions(member, view_channel=True, connect=True, speak=True)
+
+            try:
+                if member.voice and member.voice.channel:
+                    await member.move_to(channel)
+            except discord.HTTPException:
+                pass
+
+            await safe_reply(interaction, f"✅ {member.display_name} さんを許可しました。")
+
+        except Exception:
+            traceback.print_exc()
+            await safe_reply(interaction, "許可処理でエラーが発生しました。")
 
     @discord.ui.button(label="❌ 拒否", style=discord.ButtonStyle.danger)
     async def deny(self, interaction, button):
-        room = rooms.get(self.channel_id)
-        if not room:
-            return await interaction.response.send_message("部屋がありません。", ephemeral=True)
+        try:
+            room = rooms.get(self.channel_id)
+            if not room:
+                return await safe_reply(interaction, "部屋がありません。")
 
-        if interaction.user.id != room["owner_id"]:
-            return await interaction.response.send_message("部屋主だけ操作できます。", ephemeral=True)
+            if interaction.user.id != room["owner_id"] and interaction.user.id != MY_USER_ID:
+                return await safe_reply(interaction, "部屋主だけ操作できます。")
 
-        member = interaction.guild.get_member(self.requester_id)
+            member = interaction.guild.get_member(self.requester_id)
+            await safe_reply(interaction, f"❌ {member.display_name if member else '相手'} さんを拒否しました。")
 
-        await interaction.response.send_message(
-            f"❌ {member.display_name if member else '相手'} さんを拒否しました。",
-            ephemeral=True
-        )
+        except Exception:
+            traceback.print_exc()
+            await safe_reply(interaction, "拒否処理でエラーが発生しました。")
 
 
 class KnockButtonView(discord.ui.View):
@@ -367,47 +366,46 @@ class KnockButtonView(discord.ui.View):
 
     @discord.ui.button(label="🚪 ノックする", style=discord.ButtonStyle.primary)
     async def knock(self, interaction, button):
-        room = rooms.get(self.channel_id)
-        if not room:
-            return await interaction.response.send_message("この部屋はもう存在しません。", ephemeral=True)
-
-        owner = interaction.guild.get_member(room["owner_id"])
-        channel = interaction.guild.get_channel(self.channel_id)
-
-        if not owner or not channel:
-            return await interaction.response.send_message("部屋主または部屋が見つかりません。", ephemeral=True)
-
-        if interaction.user.id == owner.id:
-            return await interaction.response.send_message("自分の部屋にはノック不要です。", ephemeral=True)
-
-        if is_in_list(owner.id, "blacklist", interaction.user.id):
-            return await interaction.response.send_message("この部屋にはノックできません。", ephemeral=True)
-
-        if is_in_list(owner.id, "favorites", interaction.user.id):
-            await channel.set_permissions(interaction.user, view_channel=True, connect=True, speak=True)
-            return await interaction.response.send_message(
-                "❤️ お気に入り登録されているため、入室許可されました。",
-                ephemeral=True
-            )
-
         try:
-            await owner.send(
-                f"🚪 **{interaction.user.display_name}** さんがノックしています。\n"
-                f"サーバー: {interaction.guild.name}\n"
-                f"部屋: {channel.name}",
+            room = rooms.get(self.channel_id)
+            if not room:
+                return await safe_reply(interaction, "この部屋はもう存在しません。")
+
+            owner = interaction.guild.get_member(room["owner_id"])
+            channel = interaction.guild.get_channel(self.channel_id)
+
+            if not owner or not channel:
+                return await safe_reply(interaction, "部屋主または部屋が見つかりません。")
+
+            if interaction.user.id == owner.id:
+                return await safe_reply(interaction, "自分の部屋にはノック不要です。")
+
+            if is_in_list(owner.id, "blacklist", interaction.user.id):
+                return await safe_reply(interaction, "この部屋にはノックできません。")
+
+            if is_in_list(owner.id, "favorites", interaction.user.id):
+                await channel.set_permissions(interaction.user, view_channel=True, connect=True, speak=True)
+                return await safe_reply(interaction, "❤️ お気に入り登録されているため、入室許可されました。")
+
+            text_channel = interaction.guild.get_channel(room["knock_text_channel_id"])
+
+            if not text_channel:
+                return await safe_reply(interaction, "ノック用チャンネルが見つかりません。")
+
+            msg = await text_channel.send(
+                f"🚪 {owner.mention}\n"
+                f"**{interaction.user.display_name}** さんが `{channel.name}` にノックしています。",
                 view=KnockDecisionView(self.channel_id, interaction.user.id)
             )
-            await interaction.response.send_message("部屋主にノックを送りました！", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "部屋主にDMが送れませんでした。部屋主のDM設定を確認してください。",
-                ephemeral=True
-            )
 
+            room["message_ids"].append(msg.id)
 
-# =========================
-# 部屋管理パネル
-# =========================
+            await safe_reply(interaction, "部屋主にノックを送りました！")
+
+        except Exception:
+            traceback.print_exc()
+            await safe_reply(interaction, "ノック処理でエラーが発生しました。")
+
 
 class RenameRoomModal(discord.ui.Modal, title="部屋名変更"):
     new_name = discord.ui.TextInput(label="新しい部屋名", max_length=80)
@@ -417,12 +415,15 @@ class RenameRoomModal(discord.ui.Modal, title="部屋名変更"):
         self.channel_id = channel_id
 
     async def on_submit(self, interaction):
-        if not is_room_owner(interaction.user.id, self.channel_id):
-            return await interaction.response.send_message("部屋主だけ変更できます。", ephemeral=True)
+        if not is_room_owner(interaction.user.id, self.channel_id) and interaction.user.id != MY_USER_ID:
+            return await safe_reply(interaction, "部屋主だけ変更できます。")
 
         channel = interaction.guild.get_channel(self.channel_id)
+        if not channel:
+            return await safe_reply(interaction, "部屋が見つかりません。")
+
         await channel.edit(name=str(self.new_name))
-        await interaction.response.send_message("部屋名を変更しました。", ephemeral=True)
+        await safe_reply(interaction, "部屋名を変更しました。")
 
 
 class LimitRoomModal(discord.ui.Modal, title="人数制限変更"):
@@ -433,19 +434,22 @@ class LimitRoomModal(discord.ui.Modal, title="人数制限変更"):
         self.channel_id = channel_id
 
     async def on_submit(self, interaction):
-        if not is_room_owner(interaction.user.id, self.channel_id):
-            return await interaction.response.send_message("部屋主だけ変更できます。", ephemeral=True)
+        if not is_room_owner(interaction.user.id, self.channel_id) and interaction.user.id != MY_USER_ID:
+            return await safe_reply(interaction, "部屋主だけ変更できます。")
 
         try:
             value = int(str(self.limit))
             if value < 0 or value > 99:
                 raise ValueError
-        except:
-            return await interaction.response.send_message("0〜99の数字で入力してください。", ephemeral=True)
+        except Exception:
+            return await safe_reply(interaction, "0〜99の数字で入力してください。")
 
         channel = interaction.guild.get_channel(self.channel_id)
+        if not channel:
+            return await safe_reply(interaction, "部屋が見つかりません。")
+
         await channel.edit(user_limit=value)
-        await interaction.response.send_message(f"人数制限を {value} に変更しました。", ephemeral=True)
+        await safe_reply(interaction, f"人数制限を {value} に変更しました。")
 
 
 class RoomManageView(discord.ui.View):
@@ -456,11 +460,11 @@ class RoomManageView(discord.ui.View):
     async def owner_check(self, interaction):
         room = rooms.get(self.channel_id)
         if not room:
-            await interaction.response.send_message("部屋が存在しません。", ephemeral=True)
+            await safe_reply(interaction, "部屋が存在しません。")
             return False
 
         if interaction.user.id != room["owner_id"] and interaction.user.id != MY_USER_ID:
-            await interaction.response.send_message("部屋主だけ操作できます。", ephemeral=True)
+            await safe_reply(interaction, "部屋主だけ操作できます。")
             return False
 
         return True
@@ -481,7 +485,7 @@ class RoomManageView(discord.ui.View):
             return
         channel = interaction.guild.get_channel(self.channel_id)
         await channel.set_permissions(interaction.guild.default_role, view_channel=True, connect=False)
-        await interaction.response.send_message("鍵をかけました。", ephemeral=True)
+        await safe_reply(interaction, "鍵をかけました。")
 
     @discord.ui.button(label="🔓 鍵を開ける", style=discord.ButtonStyle.success)
     async def unlock(self, interaction, button):
@@ -489,29 +493,22 @@ class RoomManageView(discord.ui.View):
             return
         channel = interaction.guild.get_channel(self.channel_id)
         await channel.set_permissions(interaction.guild.default_role, view_channel=True, connect=True)
-        await interaction.response.send_message("鍵を開けました。", ephemeral=True)
+        await safe_reply(interaction, "鍵を開けました。")
 
     @discord.ui.button(label="⏰ 10分延長", style=discord.ButtonStyle.primary)
     async def extend(self, interaction, button):
         if not await self.owner_check(interaction):
             return
         rooms[self.channel_id]["time"] += 600
-        await interaction.response.send_message(
-            f"10分延長しました。残り {rooms[self.channel_id]['time'] // 60}分",
-            ephemeral=True
-        )
+        await safe_reply(interaction, f"10分延長しました。残り {rooms[self.channel_id]['time'] // 60}分")
 
     @discord.ui.button(label="🗑 部屋削除", style=discord.ButtonStyle.danger)
     async def delete(self, interaction, button):
         if not await self.owner_check(interaction):
             return
-        await interaction.response.send_message("部屋を削除します。", ephemeral=True)
+        await safe_reply(interaction, "部屋を削除します。")
         await delete_room(self.channel_id, interaction.guild)
 
-
-# =========================
-# 部屋作成
-# =========================
 
 async def room_timer(channel_id, guild):
     while channel_id in rooms:
@@ -551,8 +548,8 @@ async def create_free_room(guild, member, category):
         "owner_id": member.id,
         "time": ROOM_TIME,
         "type": "free",
-        "knock_message_id": None,
-        "knock_text_channel_id": None
+        "knock_text_channel_id": None,
+        "message_ids": []
     }
 
     text_channel = await get_or_create_knock_text_channel(guild)
@@ -563,7 +560,10 @@ async def create_free_room(guild, member, category):
         color=discord.Color.green()
     )
 
-    await text_channel.send(embed=embed, view=RoomManageView(channel.id))
+    msg = await text_channel.send(embed=embed, view=RoomManageView(channel.id))
+
+    rooms[channel.id]["knock_text_channel_id"] = text_channel.id
+    rooms[channel.id]["message_ids"] = [msg.id]
 
     bot.loop.create_task(room_timer(channel.id, guild))
     return channel
@@ -593,8 +593,8 @@ async def create_knock_room(guild, member, category):
         "owner_id": member.id,
         "time": ROOM_TIME,
         "type": "knock",
-        "knock_message_id": None,
-        "knock_text_channel_id": None
+        "knock_text_channel_id": None,
+        "message_ids": []
     }
 
     text_channel = await get_or_create_knock_text_channel(guild)
@@ -609,23 +609,18 @@ async def create_knock_room(guild, member, category):
         color=discord.Color.purple()
     )
 
-    msg = await text_channel.send(embed=embed, view=KnockButtonView(channel.id))
-
-    rooms[channel.id]["knock_message_id"] = msg.id
-    rooms[channel.id]["knock_text_channel_id"] = text_channel.id
-
-    await text_channel.send(
+    knock_msg = await text_channel.send(embed=embed, view=KnockButtonView(channel.id))
+    manage_msg = await text_channel.send(
         f"🎛 {member.mention} さんの部屋管理パネル",
         view=RoomManageView(channel.id)
     )
 
+    rooms[channel.id]["knock_text_channel_id"] = text_channel.id
+    rooms[channel.id]["message_ids"] = [knock_msg.id, manage_msg.id]
+
     bot.loop.create_task(room_timer(channel.id, guild))
     return channel
 
-
-# =========================
-# VCパネル
-# =========================
 
 class MainVCPanelView(discord.ui.View):
     def __init__(self):
@@ -633,63 +628,57 @@ class MainVCPanelView(discord.ui.View):
 
     @discord.ui.button(label="🔑 ノック部屋作成", style=discord.ButtonStyle.secondary, custom_id="knock_room_create")
     async def knock_create(self, interaction, button):
-        category = interaction.channel.category if interaction.channel else None
-
         try:
+            category = interaction.channel.category if interaction.channel else None
             channel = await create_knock_room(interaction.guild, interaction.user, category)
-        except discord.Forbidden:
-            return await interaction.response.send_message(
-                "Botの権限が足りません。チャンネル管理・メンバー移動権限を確認してください。",
-                ephemeral=True
+
+            if interaction.user.voice and interaction.user.voice.channel:
+                try:
+                    await interaction.user.move_to(channel)
+                except discord.HTTPException:
+                    pass
+
+            await safe_reply(
+                interaction,
+                f"🔐 ノック部屋を作成しました: {channel.mention}\n"
+                f"`#{KNOCK_TEXT_CHANNEL_NAME}` にノックボタンを表示しました。"
             )
-
-        if interaction.user.voice and interaction.user.voice.channel:
-            try:
-                await interaction.user.move_to(channel)
-            except:
-                pass
-
-        await interaction.response.send_message(
-            f"🔐 ノック部屋を作成しました: {channel.mention}\n"
-            f"`#{KNOCK_TEXT_CHANNEL_NAME}` にノックボタンを表示しました。",
-            ephemeral=True
-        )
+        except discord.Forbidden:
+            await safe_reply(interaction, "Botの権限が足りません。チャンネル管理・メンバー移動権限を確認してください。")
+        except Exception:
+            traceback.print_exc()
+            await safe_reply(interaction, "ノック部屋作成でエラーが発生しました。")
 
     @discord.ui.button(label="🔓 貸切部屋作成", style=discord.ButtonStyle.success, custom_id="free_room_create")
     async def free_create(self, interaction, button):
-        category = interaction.channel.category if interaction.channel else None
-
         try:
+            category = interaction.channel.category if interaction.channel else None
             channel = await create_free_room(interaction.guild, interaction.user, category)
+
+            if interaction.user.voice and interaction.user.voice.channel:
+                try:
+                    await interaction.user.move_to(channel)
+                except discord.HTTPException:
+                    pass
+
+            await safe_reply(interaction, f"🔓 貸切部屋を作成しました: {channel.mention}")
         except discord.Forbidden:
-            return await interaction.response.send_message(
-                "Botの権限が足りません。チャンネル管理・メンバー移動権限を確認してください。",
-                ephemeral=True
-            )
-
-        if interaction.user.voice and interaction.user.voice.channel:
-            try:
-                await interaction.user.move_to(channel)
-            except:
-                pass
-
-        await interaction.response.send_message(
-            f"🔓 貸切部屋を作成しました: {channel.mention}",
-            ephemeral=True
-        )
+            await safe_reply(interaction, "Botの権限が足りません。チャンネル管理・メンバー移動権限を確認してください。")
+        except Exception:
+            traceback.print_exc()
+            await safe_reply(interaction, "貸切部屋作成でエラーが発生しました。")
 
 
 @bot.tree.command(name="setupvc", description="VC作成パネルを設置")
 async def setupvc(interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
     await interaction.response.send_message(
         "作成する部屋タイプを選んでください。",
         view=MainVCPanelView()
     )
 
-
-# =========================
-# 募集
-# =========================
 
 class RecruitView(discord.ui.View):
     def __init__(self, author_id):
@@ -699,16 +688,16 @@ class RecruitView(discord.ui.View):
     @discord.ui.button(label="立候補する", style=discord.ButtonStyle.green)
     async def apply(self, interaction, button):
         if interaction.user.id == self.author_id:
-            return await interaction.response.send_message("自分の募集には立候補できません。", ephemeral=True)
+            return await safe_reply(interaction, "自分の募集には立候補できません。")
 
         author = interaction.guild.get_member(self.author_id)
         if author:
             try:
                 await author.send(f"📩 {interaction.user.display_name} さんが立候補しました！")
-            except:
+            except discord.HTTPException:
                 pass
 
-        await interaction.response.send_message("立候補しました！", ephemeral=True)
+        await safe_reply(interaction, "立候補しました！")
 
 
 class RecruitTargetView(discord.ui.View):
@@ -730,7 +719,7 @@ class RecruitTargetView(discord.ui.View):
         embed.set_footer(text=f"募集主: {interaction.user.display_name}")
 
         await channel.send(embed=embed, view=RecruitView(self.author_id))
-        await interaction.response.send_message("募集を送信しました。", ephemeral=True)
+        await safe_reply(interaction, "募集を送信しました。")
 
     @discord.ui.button(label="男性宛", style=discord.ButtonStyle.primary)
     async def men(self, interaction, button):
@@ -747,16 +736,15 @@ class RecruitTargetView(discord.ui.View):
 
 @bot.tree.command(name="募集", description="なう募集へ通知")
 async def bosyu(interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
     await interaction.response.send_message(
         "募集先を選んでください。",
         view=RecruitTargetView(interaction.user.id),
         ephemeral=True
     )
 
-
-# =========================
-# 受付VC自動作成
-# =========================
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -767,8 +755,8 @@ async def on_voice_state_update(member, before, after):
         try:
             channel = await create_free_room(after.channel.guild, member, after.channel.category)
             await member.move_to(channel)
-        except:
-            pass
+        except Exception:
+            traceback.print_exc()
 
     if before.channel and before.channel.id in rooms:
         if len(before.channel.members) == 0:
