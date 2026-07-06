@@ -410,6 +410,7 @@ def can_create_room(guild_id: int, user_id: int):
     return True, 0
 
 
+
 async def get_or_create_status_channel(guild: discord.Guild):
     configured_id = get_config_channel_id(guild.id, "status_channel_id", 0)
     if configured_id:
@@ -438,6 +439,26 @@ async def get_or_create_status_channel(guild: discord.Guild):
     return await guild.create_text_channel(STATUS_CHANNEL_NAME, overwrites=overwrites)
 
 
+async def cleanup_old_status_messages(channel: discord.TextChannel, keep_message_id: int | None = None):
+    try:
+        async for msg in channel.history(limit=30):
+            if msg.author != channel.guild.me:
+                continue
+
+            if keep_message_id and msg.id == keep_message_id:
+                continue
+
+            if msg.embeds and msg.embeds[0].title == "🎙 VCダッシュボード":
+                try:
+                    await msg.delete()
+                except discord.HTTPException:
+                    pass
+    except discord.HTTPException:
+        pass
+    except Exception:
+        traceback.print_exc()
+
+
 async def update_status_panel(guild: discord.Guild):
     try:
         channel = await get_or_create_status_channel(guild)
@@ -453,54 +474,76 @@ async def update_status_panel(guild: discord.Guild):
             owner = guild.get_member(room.get("owner_id"))
             total_members += len(vc.members)
 
-            type_text = "🔐 ノック" if room.get("type") == "knock" else ("🎫 招待制" if room.get("type") == "invite" else "🔓 貸切")
+            if room.get("type") == "knock":
+                type_text = "🔐 ノック"
+            elif room.get("type") == "invite":
+                type_text = "🎫 招待制"
+            else:
+                type_text = "🔓 貸切"
+
+            member_names = "、".join(m.display_name for m in vc.members if not m.bot)
+            if not member_names:
+                member_names = "利用者なし"
+
             active_room_items.append(
-                f"{type_text} {vc.mention} / {len(vc.members)}人 / 部屋主: {owner.mention if owner else '不明'}"
+                f"{type_text} {vc.mention} **{len(vc.members)}人**\\n"
+                f"部屋主: {owner.mention if owner else '不明'}\\n"
+                f"メンバー: {member_names}"
             )
 
+        online_count = sum(
+            1 for m in guild.members
+            if not m.bot and getattr(m, "status", None) != discord.Status.offline
+        )
+        member_count = len([m for m in guild.members if not m.bot])
+
         embed = discord.Embed(
-            title="🎙 VC稼働状況",
+            title="🎙 VCダッシュボード",
             color=discord.Color.blurple(),
             timestamp=discord.utils.utcnow(),
         )
-        embed.add_field(name="現在の個室数", value=f"{len(active_room_items)}部屋", inline=True)
-        embed.add_field(name="個室内人数", value=f"{total_members}人", inline=True)
+        embed.add_field(name="👥 サーバーメンバー", value=f"{member_count}人", inline=True)
+        embed.add_field(name="🟢 オンライン目安", value=f"{online_count}人", inline=True)
+        embed.add_field(name="🎤 VC利用者", value=f"{total_members}人", inline=True)
+        embed.add_field(name="稼働中の個室", value=f"{len(active_room_items)}部屋", inline=True)
         embed.add_field(
-            name="稼働中の部屋",
-            value="\\n".join(active_room_items[:20]) if active_room_items else "（なし）",
+            name="📺 VC一覧",
+            value="\\n\\n".join(active_room_items[:10]) if active_room_items else "（現在稼働中の個室はありません）",
             inline=False,
         )
 
+        if len(active_room_items) > 10:
+            embed.set_footer(text=f"他 {len(active_room_items) - 10}部屋があります。")
+
         old_id = status_message_ids.get(guild.id)
-        if old_id:
+        stored_id = get_config(guild.id, "status_message_id", None)
+
+        for candidate in [old_id, int(stored_id) if stored_id and str(stored_id).isdigit() else None]:
+            if not candidate:
+                continue
             try:
-                msg = await channel.fetch_message(old_id)
+                msg = await channel.fetch_message(candidate)
                 await msg.edit(embed=embed)
+                status_message_ids[guild.id] = msg.id
+                set_config(guild.id, "status_message_id", str(msg.id))
+                await cleanup_old_status_messages(channel, keep_message_id=msg.id)
                 return
             except discord.HTTPException:
                 pass
 
         msg = await channel.send(embed=embed)
         status_message_ids[guild.id] = msg.id
+        set_config(guild.id, "status_message_id", str(msg.id))
+        await cleanup_old_status_messages(channel, keep_message_id=msg.id)
 
     except Exception:
         traceback.print_exc()
 
 
 async def log_voice_move(member: discord.Member, channel: discord.VoiceChannel, action: str):
-    try:
-        guild = channel.guild
-        embed = discord.Embed(
-            title="🚪 VC入退室ログ",
-            color=discord.Color.blue() if action == "入室" else discord.Color.dark_grey(),
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.add_field(name="メンバー", value=f"{member.mention}\\nID: `{member.id}`", inline=True)
-        embed.add_field(name="操作", value=action, inline=True)
-        embed.add_field(name="部屋", value=f"{channel.mention}\\n`{channel.name}`", inline=False)
-        await send_admin_log(guild, embed)
-    except Exception:
-        traceback.print_exc()
+    # 入退室ログは大量通知防止のため送信しません。
+    # VC状況は update_status_panel() の1メッセージだけで更新します。
+    return
 
 
 async def transfer_room_owner_if_needed(channel: discord.VoiceChannel):
@@ -909,6 +952,7 @@ async def delayed_empty_delete(channel_id: int, guild: discord.Guild, delay_seco
         if not channel:
             rooms.pop(channel_id, None)
             empty_delete_tasks.pop(channel_id, None)
+            await update_status_panel(guild)
             return
 
         if channel_id in rooms and len(channel.members) == 0:
@@ -2511,6 +2555,21 @@ async def tarot(interaction: discord.Interaction, question: str | None = None):
     embed.add_field(name="ひとこと", value=advice, inline=False)
 
     await interaction.response.send_message(embed=embed)
+
+
+
+@bot.tree.command(name="set_status_channel", description="VC状況チャンネルを設定する")
+@app_commands.describe(channel="VC状況を表示するテキストチャンネル")
+async def set_status_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(interaction.guild.id, "status_channel_id", str(channel.id))
+    set_config(interaction.guild.id, "status_message_id", "0")
+    await update_status_panel(interaction.guild)
+    await safe_reply(interaction, f"VC状況チャンネルを {channel.mention} に設定しました。")
 
 
 # =========================================================
