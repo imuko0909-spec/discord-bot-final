@@ -79,6 +79,17 @@ def init_db():
         )
     """)
 
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS user_activity (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            action TEXT,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+
     db.commit()
 
 
@@ -176,6 +187,101 @@ def format_seconds(seconds):
     return f"{hours}時間{minutes}分"
 
 
+def record_activity(guild_id: int, user_id: int, action: str = "activity"):
+    if not guild_id or not user_id:
+        return
+
+    now = int(time.time())
+
+    db.execute(
+        """
+        INSERT INTO user_activity (guild_id, user_id, last_seen, action)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET last_seen=excluded.last_seen, action=excluded.action
+        """,
+        (guild_id, user_id, now, action)
+    )
+    db.commit()
+
+
+def format_last_seen(timestamp_value):
+    if not timestamp_value:
+        return "記録なし"
+
+    diff = max(0, int(time.time()) - int(timestamp_value))
+
+    if diff < 60:
+        return "たった今"
+    if diff < 3600:
+        return f"{diff // 60}分前"
+    if diff < 86400:
+        return f"{diff // 3600}時間前"
+
+    return f"{diff // 86400}日前"
+
+
+def get_activity_lists(guild: discord.Guild, active_days: int = 7, limit: int = 15):
+    now = int(time.time())
+    border = now - active_days * 86400
+
+    cur = db.execute(
+        """
+        SELECT user_id, last_seen, action
+        FROM user_activity
+        WHERE guild_id=?
+        ORDER BY last_seen DESC
+        """,
+        (guild.id,)
+    )
+
+    rows = cur.fetchall()
+    activity_map = {
+        user_id: (last_seen, action)
+        for user_id, last_seen, action in rows
+    }
+
+    active_lines = []
+    inactive_lines = []
+    no_record_lines = []
+
+    members = [m for m in guild.members if not m.bot]
+
+    for member in members:
+        data = activity_map.get(member.id)
+
+        if data:
+            last_seen, action = data
+            line = f"・{member.display_name}：{format_last_seen(last_seen)}"
+
+            if last_seen >= border:
+                active_lines.append((last_seen, line))
+            else:
+                inactive_lines.append((last_seen, line))
+        else:
+            no_record_lines.append(f"・{member.display_name}")
+
+    active_lines.sort(reverse=True, key=lambda x: x[0])
+    inactive_lines.sort(key=lambda x: x[0])
+
+    def pack(lines, total_count=None):
+        if not lines:
+            return "（なし）"
+
+        text_lines = lines[:limit]
+        text = "\n".join(text_lines)
+
+        if total_count and total_count > limit:
+            text += f"\n…他 {total_count - limit}人"
+
+        return text[:1024]
+
+    active_text = pack([line for _, line in active_lines], len(active_lines))
+    inactive_text = pack([line for _, line in inactive_lines], len(inactive_lines))
+    no_record_text = pack(no_record_lines, len(no_record_lines))
+
+    return active_text, inactive_text, no_record_text
+
 init_db()
 
 
@@ -206,6 +312,24 @@ class MyBot(commands.Bot):
 
 
 bot = MyBot()
+
+
+@bot.listen("on_interaction")
+async def activity_interaction_listener(interaction: discord.Interaction):
+    try:
+        if interaction.guild and interaction.user and not interaction.user.bot:
+            command_name = getattr(getattr(interaction, "command", None), "name", None)
+
+            custom_id = None
+            try:
+                custom_id = interaction.data.get("custom_id") if isinstance(interaction.data, dict) else None
+            except Exception:
+                custom_id = None
+
+            action = command_name or custom_id or interaction.type.name
+            record_activity(interaction.guild.id, interaction.user.id, action)
+    except Exception:
+        traceback.print_exc()
 
 
 @bot.event
@@ -1217,6 +1341,29 @@ async def server_stats(interaction: discord.Interaction):
     embed.add_field(name="⏰ 延長", value=f"{row[8] or 0}回", inline=True)
     embed.add_field(name="⏱ 合計利用時間", value=format_seconds(row[9] or 0), inline=False)
 
+
+    active_text, inactive_text, no_record_text = get_activity_lists(
+        interaction.guild,
+        active_days=7,
+        limit=15
+    )
+
+    embed.add_field(
+        name="🟢 最近浮上した人（7日以内）",
+        value=active_text,
+        inline=False
+    )
+    embed.add_field(
+        name="🌙 しばらく浮上してない人（7日以上）",
+        value=inactive_text,
+        inline=False
+    )
+    embed.add_field(
+        name="⚪ Botで浮上記録なし",
+        value=no_record_text,
+        inline=False
+    )
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1228,6 +1375,14 @@ async def server_stats(interaction: discord.Interaction):
 async def on_voice_state_update(member, before, after):
     if member.bot:
         return
+
+    try:
+        if after.channel:
+            record_activity(after.channel.guild.id, member.id, "voice_join")
+        elif before.channel:
+            record_activity(before.channel.guild.id, member.id, "voice_leave")
+    except Exception:
+        traceback.print_exc()
 
     if after.channel and after.channel.id == RECEPTION_CHANNEL_ID:
         try:
