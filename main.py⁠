@@ -18,7 +18,7 @@ KNOCK_TEXT_CHANNEL_NAME = "ノック"
 RECRUIT_CHANNEL_NAME = "なう募集"
 ADMIN_LOG_CHANNEL_NAME = "管理ログ"
 
-ROOM_TIME = 600  # 10分
+ROOM_TIME = 0  # 時間制限なし。空室30秒で削除
 
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 if not TOKEN:
@@ -30,6 +30,7 @@ intents.voice_states = True
 intents.message_content = True
 
 rooms = {}
+empty_delete_tasks = {}
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "bot_data.db")
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -491,6 +492,7 @@ def get_room_guild_and_channel(guild_id: int, channel_id: int):
 
 
 async def delete_room(channel_id: int, guild: discord.Guild, reason: str = "不明"):
+    cancel_empty_delete(channel_id)
     room = rooms.get(channel_id)
     channel_for_log = guild.get_channel(channel_id)
     channel_name_for_log = channel_for_log.name if channel_for_log else None
@@ -928,14 +930,6 @@ class RoomManageView(discord.ui.View):
         await channel.set_permissions(interaction.guild.default_role, view_channel=True, connect=True)
         await safe_reply(interaction, "鍵を開けました。")
 
-    @discord.ui.button(label="⏰ 10分延長", style=discord.ButtonStyle.primary)
-    async def extend(self, interaction, button):
-        if not await self.owner_check(interaction):
-            return
-        rooms[self.channel_id]["time"] += 600
-        add_stat(interaction.guild.id, interaction.user.id, "extend_count")
-        await safe_reply(interaction, f"10分延長しました。残り {rooms[self.channel_id]['time'] // 60}分")
-
     @discord.ui.button(label="🗑 部屋削除", style=discord.ButtonStyle.danger)
     async def delete(self, interaction, button):
         if not await self.owner_check(interaction):
@@ -1009,7 +1003,6 @@ async def create_free_room(guild, member, category):
     rooms[channel.id]["knock_text_channel_id"] = text_channel.id
     rooms[channel.id]["message_ids"] = [msg.id]
 
-    bot.loop.create_task(room_timer(channel.id, guild))
     await log_room_created(guild, member, channel, "free")
     return channel
 
@@ -1066,7 +1059,6 @@ async def create_knock_room(guild, member, category):
     rooms[channel.id]["knock_text_channel_id"] = text_channel.id
     rooms[channel.id]["message_ids"] = [manage_msg.id]
 
-    bot.loop.create_task(room_timer(channel.id, guild))
     await log_room_created(guild, member, channel, "knock")
     return channel
 
@@ -1236,8 +1228,7 @@ async def history(interaction: discord.Interaction):
     embed.add_field(name="✅ 許可", value=f"{row[5]}回", inline=True)
     embed.add_field(name="❌ 拒否", value=f"{row[6]}回", inline=True)
     embed.add_field(name="📢 募集", value=f"{row[7]}回", inline=True)
-    embed.add_field(name="⏰ 延長", value=f"{row[8]}回", inline=True)
-    embed.add_field(name="⏱ 合計利用時間", value=format_seconds(row[9]), inline=False)
+        embed.add_field(name="⏱ 合計利用時間", value=format_seconds(row[9]), inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1338,7 +1329,6 @@ async def server_stats(interaction: discord.Interaction):
     embed.add_field(name="✅ 許可", value=f"{row[5] or 0}回", inline=True)
     embed.add_field(name="❌ 拒否", value=f"{row[6] or 0}回", inline=True)
     embed.add_field(name="📢 募集", value=f"{row[7] or 0}回", inline=True)
-    embed.add_field(name="⏰ 延長", value=f"{row[8] or 0}回", inline=True)
     embed.add_field(name="⏱ 合計利用時間", value=format_seconds(row[9] or 0), inline=False)
 
 
@@ -1384,6 +1374,9 @@ async def on_voice_state_update(member, before, after):
     except Exception:
         traceback.print_exc()
 
+    if after.channel and after.channel.id in rooms:
+        cancel_empty_delete(after.channel.id)
+
     if after.channel and after.channel.id == RECEPTION_CHANNEL_ID:
         try:
             channel = await create_free_room(after.channel.guild, member, after.channel.category)
@@ -1393,7 +1386,7 @@ async def on_voice_state_update(member, before, after):
 
     if before.channel and before.channel.id in rooms:
         if len(before.channel.members) == 0:
-            await delete_room(before.channel.id, before.channel.guild, reason="空室になったため自動削除")
+            schedule_empty_delete(before.channel.id, before.channel.guild)
 
 
 bot.run(TOKEN)
