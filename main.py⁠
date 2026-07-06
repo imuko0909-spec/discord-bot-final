@@ -7,6 +7,7 @@ import os
 import sqlite3
 import time
 import traceback
+import random
 
 
 # =========================================================
@@ -50,10 +51,37 @@ rooms = {}
 empty_delete_tasks = {}
 room_create_cooldowns = {}
 status_message_ids = {}
+relay_sessions = {}
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "bot_data.db")
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 
+
+
+TAROT_CARDS = [
+    ("愚者", "自由・新しい始まり・可能性", "無計画・軽率・迷い"),
+    ("魔術師", "行動力・才能・チャンス", "準備不足・自信喪失・空回り"),
+    ("女教皇", "直感・冷静・秘密", "不安・考えすぎ・閉鎖的"),
+    ("女帝", "愛情・豊かさ・魅力", "依存・わがまま・停滞"),
+    ("皇帝", "安定・責任・リーダーシップ", "頑固・支配的・重圧"),
+    ("教皇", "信頼・助言・協調", "束縛・古い考え・不一致"),
+    ("恋人", "恋愛・選択・調和", "迷い・すれ違い・誘惑"),
+    ("戦車", "前進・勝利・勢い", "暴走・焦り・空回り"),
+    ("力", "優しさ・忍耐・内なる強さ", "弱気・我慢不足・不安定"),
+    ("隠者", "内省・慎重・探求", "孤立・考えすぎ・閉じこもり"),
+    ("運命の輪", "転機・幸運・流れの変化", "タイミング不足・停滞・予想外"),
+    ("正義", "公平・判断・バランス", "不公平・迷い・偏り"),
+    ("吊るされた男", "忍耐・視点変更・試練", "報われない我慢・停滞・執着"),
+    ("死神", "終わりと始まり・変化・再出発", "手放せない・未練・停滞"),
+    ("節制", "調和・自然体・安定", "不調和・無理・バランス崩れ"),
+    ("悪魔", "執着・誘惑・欲望", "解放・断ち切る・目覚め"),
+    ("塔", "衝撃・崩壊・真実", "トラブル回避・再建・小さな崩れ"),
+    ("星", "希望・癒し・理想", "失望・自信低下・期待しすぎ"),
+    ("月", "不安・曖昧・迷い", "不安解消・真実が見える・回復"),
+    ("太陽", "成功・幸福・明るさ", "油断・空回り・延期"),
+    ("審判", "復活・決断・チャンス再来", "迷い・過去への執着・停滞"),
+    ("世界", "完成・達成・満足", "未完成・中途半端・あと一歩"),
+]
 
 # =========================================================
 # DB
@@ -1759,7 +1787,26 @@ class RecruitTargetView(discord.ui.View):
         )
         embed.set_footer(text=f"募集主: {interaction.user.display_name}")
 
-        await channel.send(embed=embed, view=RecruitView(self.author_id))
+        male_role = interaction.guild.get_role(get_config_channel_id(interaction.guild.id, "male_role_id", 0))
+        female_role = interaction.guild.get_role(get_config_channel_id(interaction.guild.id, "female_role_id", 0))
+
+        mentions = []
+        if target == "男性" and male_role:
+            mentions.append(male_role.mention)
+        elif target == "女性" and female_role:
+            mentions.append(female_role.mention)
+        elif target == "男性・女性":
+            if male_role:
+                mentions.append(male_role.mention)
+            if female_role:
+                mentions.append(female_role.mention)
+
+        await channel.send(
+            content=" ".join(mentions) if mentions else None,
+            embed=embed,
+            view=RecruitView(self.author_id),
+            allowed_mentions=discord.AllowedMentions(roles=True)
+        )
         add_stat(interaction.guild.id, interaction.user.id, "recruit_count")
         await safe_reply(interaction, "募集を送信しました。")
 
@@ -2121,6 +2168,284 @@ async def admin_dashboard(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
+
+
+# =========================================================
+# 通知ロール・個室リレー・タロット
+# =========================================================
+
+@bot.tree.command(name="set_male_role", description="男性募集で通知するロールを設定する")
+@app_commands.describe(role="男性募集でメンションするロール")
+async def set_male_role(interaction: discord.Interaction, role: discord.Role):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(interaction.guild.id, "male_role_id", str(role.id))
+    await safe_reply(interaction, f"男性募集ロールを {role.mention} に設定しました。")
+
+
+@bot.tree.command(name="set_female_role", description="女性募集で通知するロールを設定する")
+@app_commands.describe(role="女性募集でメンションするロール")
+async def set_female_role(interaction: discord.Interaction, role: discord.Role):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(interaction.guild.id, "female_role_id", str(role.id))
+    await safe_reply(interaction, f"女性募集ロールを {role.mention} に設定しました。")
+
+
+@bot.tree.command(name="relay_config", description="個室リレーの設定をする")
+@app_commands.describe(
+    waiting_vc="待機ブースにするVC",
+    rounds="ラウンド数",
+    round_seconds="1ラウンドの秒数",
+    break_seconds="待機時間の秒数"
+)
+async def relay_config(
+    interaction: discord.Interaction,
+    waiting_vc: discord.VoiceChannel,
+    rounds: int = 3,
+    round_seconds: int = 180,
+    break_seconds: int = 30,
+):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    rounds = max(1, min(20, rounds))
+    round_seconds = max(30, min(1800, round_seconds))
+    break_seconds = max(5, min(300, break_seconds))
+
+    set_config(interaction.guild.id, "relay_waiting_vc_id", str(waiting_vc.id))
+    set_config(interaction.guild.id, "relay_rounds", str(rounds))
+    set_config(interaction.guild.id, "relay_round_seconds", str(round_seconds))
+    set_config(interaction.guild.id, "relay_break_seconds", str(break_seconds))
+
+    await safe_reply(
+        interaction,
+        f"個室リレー設定を保存しました。\\n"
+        f"待機ブース: {waiting_vc.mention}\\n"
+        f"ラウンド: {rounds}\\n"
+        f"通話時間: {round_seconds}秒\\n"
+        f"待機時間: {break_seconds}秒"
+    )
+
+
+async def create_relay_room(guild: discord.Guild, category, members: list[discord.Member], round_no: int, room_no: int):
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            manage_channels=True,
+            move_members=True,
+        ),
+    }
+
+    for member in members:
+        overwrites[member] = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+        )
+
+    return await guild.create_voice_channel(
+        name=f"🔁リレー R{round_no}-{room_no}",
+        category=category,
+        overwrites=overwrites,
+    )
+
+
+async def run_relay_session(guild: discord.Guild, starter_id: int):
+    session = relay_sessions.get(guild.id)
+    if not session:
+        return
+
+    waiting_vc = guild.get_channel(session["waiting_vc_id"])
+    if not isinstance(waiting_vc, discord.VoiceChannel):
+        relay_sessions.pop(guild.id, None)
+        return
+
+    rounds = session["rounds"]
+    round_seconds = session["round_seconds"]
+    break_seconds = session["break_seconds"]
+    category = waiting_vc.category
+
+    try:
+        for round_no in range(1, rounds + 1):
+            if not session.get("running"):
+                break
+
+            participants = [
+                m for m in waiting_vc.members
+                if not m.bot and m.id != starter_id
+            ]
+
+            if len(participants) < 2:
+                await send_admin_log(
+                    guild,
+                    discord.Embed(
+                        title="🔁 個室リレー停止",
+                        description="参加者が2人未満のため停止しました。",
+                        color=discord.Color.red(),
+                        timestamp=discord.utils.utcnow(),
+                    )
+                )
+                break
+
+            random.shuffle(participants)
+            pairs = []
+            for i in range(0, len(participants), 2):
+                group = participants[i:i + 2]
+                if len(group) == 2:
+                    pairs.append(group)
+
+            created_channels = []
+
+            embed = discord.Embed(
+                title=f"🔁 個室リレー Round {round_no}/{rounds}",
+                description=f"通話時間: {round_seconds}秒",
+                color=discord.Color.blurple(),
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.add_field(name="組数", value=f"{len(pairs)}組", inline=True)
+            await send_admin_log(guild, embed)
+
+            for idx, pair in enumerate(pairs, start=1):
+                channel = await create_relay_room(guild, category, pair, round_no, idx)
+                created_channels.append(channel)
+
+                for member in pair:
+                    try:
+                        await member.move_to(channel)
+                    except discord.HTTPException:
+                        pass
+
+            await asyncio.sleep(round_seconds)
+
+            for channel in created_channels:
+                for member in list(channel.members):
+                    try:
+                        await member.move_to(waiting_vc)
+                    except discord.HTTPException:
+                        pass
+
+                try:
+                    await channel.delete()
+                except discord.HTTPException:
+                    pass
+
+            if round_no < rounds and session.get("running"):
+                await asyncio.sleep(break_seconds)
+
+        relay_sessions.pop(guild.id, None)
+
+        await send_admin_log(
+            guild,
+            discord.Embed(
+                title="✅ 個室リレー終了",
+                description="個室リレーが終了しました。",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow(),
+            )
+        )
+
+    except Exception:
+        traceback.print_exc()
+        relay_sessions.pop(guild.id, None)
+
+
+@bot.tree.command(name="relay_start", description="個室リレーを開始する")
+@app_commands.describe(rounds="今回だけ使うラウンド数。未指定なら設定値")
+async def relay_start(interaction: discord.Interaction, rounds: int | None = None):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    if interaction.guild.id in relay_sessions:
+        return await safe_reply(interaction, "すでに個室リレーが実行中です。")
+
+    waiting_vc_id = get_config_channel_id(interaction.guild.id, "relay_waiting_vc_id", 0)
+    waiting_vc = interaction.guild.get_channel(waiting_vc_id)
+
+    if not isinstance(waiting_vc, discord.VoiceChannel):
+        return await safe_reply(interaction, "`/relay_config` で待機ブースを設定してください。")
+
+    configured_rounds = int(get_config(interaction.guild.id, "relay_rounds", "3"))
+    round_seconds = int(get_config(interaction.guild.id, "relay_round_seconds", "180"))
+    break_seconds = int(get_config(interaction.guild.id, "relay_break_seconds", "30"))
+
+    use_rounds = rounds if rounds is not None else configured_rounds
+    use_rounds = max(1, min(20, use_rounds))
+
+    relay_sessions[interaction.guild.id] = {
+        "running": True,
+        "waiting_vc_id": waiting_vc.id,
+        "rounds": use_rounds,
+        "round_seconds": round_seconds,
+        "break_seconds": break_seconds,
+        "starter_id": interaction.user.id,
+    }
+
+    bot.loop.create_task(run_relay_session(interaction.guild, interaction.user.id))
+
+    await safe_reply(
+        interaction,
+        f"個室リレーを開始しました。\\n"
+        f"待機ブース: {waiting_vc.mention}\\n"
+        f"ラウンド: {use_rounds}\\n"
+        f"通話: {round_seconds}秒 / 待機: {break_seconds}秒\\n"
+        f"※実行者は待機ブースから移動しません。"
+    )
+
+
+@bot.tree.command(name="relay_stop", description="個室リレーを停止する")
+async def relay_stop(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    session = relay_sessions.get(interaction.guild.id)
+    if not session:
+        return await safe_reply(interaction, "実行中の個室リレーはありません。")
+
+    session["running"] = False
+    await safe_reply(interaction, "個室リレーを停止します。")
+
+
+@bot.tree.command(name="tarot", description="タロット占いをする")
+@app_commands.describe(question="占いたいこと。未入力でもOK")
+async def tarot(interaction: discord.Interaction, question: str | None = None):
+    card_name, upright_meaning, reversed_meaning = random.choice(TAROT_CARDS)
+    reversed_card = random.choice([True, False])
+
+    position = "逆位置" if reversed_card else "正位置"
+    meaning = reversed_meaning if reversed_card else upright_meaning
+
+    embed = discord.Embed(
+        title="🔮 タロット占い",
+        color=discord.Color.purple(),
+        timestamp=discord.utils.utcnow(),
+    )
+
+    if question:
+        embed.add_field(name="占い内容", value=question[:1024], inline=False)
+
+    embed.add_field(name="カード", value=f"**{card_name}**", inline=True)
+    embed.add_field(name="向き", value=position, inline=True)
+    embed.add_field(name="意味", value=meaning, inline=False)
+
+    advice = "焦らず、今は一度立ち止まって流れを整えるタイミングです。" if reversed_card else "前向きに動くことで流れが良くなりそうです。"
+    embed.add_field(name="ひとこと", value=advice, inline=False)
+
+    await interaction.response.send_message(embed=embed)
 
 
 # =========================================================
