@@ -525,19 +525,17 @@ import sqlite3
 import os
 
 # --- 設定項目 ---
-MY_USER_ID = 1232865763094827112
-RECEPTION_CHANNEL_ID = 1521453980268498974
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 
 # --- Bot設定 ---
 intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
-intents.message_content = True # 警告対策
+intents.message_content = True 
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- データベース等の準備は省略（既存のものをそのまま利用してください） ---
+# 簡易的な部屋管理用変数
 rooms = {}
 
 # --- [新機能] 部屋選択メニュー ---
@@ -563,7 +561,7 @@ class SelectRoomTypeView(discord.ui.View):
 
     @discord.ui.button(label="🔓 貸切(フリー)部屋を作成", style=discord.ButtonStyle.success)
     async def free_room(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 既存のcreate_private_roomを呼び出し
+        # 元のcreate_private_room関数を呼び出す前提
         new_channel = await create_private_room(interaction.guild, interaction.user, self.category)
         await interaction.response.send_message(f"貸切部屋を作成しました: {new_channel.mention}", ephemeral=True)
 
@@ -577,7 +575,6 @@ class KnockButtonView(discord.ui.View):
         owner = interaction.guild.get_member(self.owner_id)
         if not owner:
             return await interaction.response.send_message("オーナーが見つかりません。", ephemeral=True)
-        
         await interaction.response.send_message("オーナーに通知しました。", ephemeral=True)
         await owner.send(f"{interaction.user.mention} さんがあなたの部屋に入りたがっています！", 
                          view=ApproveView(interaction.user.id, interaction.channel.id))
@@ -597,22 +594,32 @@ class ApproveView(discord.ui.View):
         else:
             await interaction.response.send_message("部屋が見つかりません。")
 
-# --- コマンド同期の修正 ---
-@bot.event
-async def on_ready():
-    await bot.tree.sync() # 起動時に強制同期
-    print(f"✅ {bot.user} でログイン完了。コマンドを同期しました。")
-
-@bot.tree.command(name="vcpanel", description="VC作成パネルを設置する")
-async def vcpanel(interaction: discord.Interaction):
+# --- コマンド ---
+@bot.tree.command(name="setupvc", description="VC作成パネルを設置する")
+async def setupvc(interaction: discord.Interaction):
     category = interaction.channel.category
     await interaction.response.send_message(
         "作成する部屋のタイプを選んでください。",
         view=SelectRoomTypeView(category)
     )
 
-# ここに既存の create_private_room 関数などの残りコードを配置してください
-# （元のコードで使っていた関数をそのまま下に貼り付けてください）
+# --- 同期・起動処理 ---
+@bot.event
+async def on_ready():
+    # 古いコマンドを削除して新しく登録し直す
+    bot.tree.clear_commands(guild=None)
+    for guild in bot.guilds:
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        print(f"✅ {guild.name} にコマンドを同期しました。")
+    print(f"✅ {bot.user} でログイン完了。")
+
+# --- 元のコードで使っていた関数をここに追加 ---
+async def create_private_room(guild, member, category):
+    # 元のロジックをここに貼り付けてください
+    pass 
+
+# (ここに元のコードの残りの関数、on_voice_state_updateなどを貼り付けてください)
 
 bot.run(TOKEN)
 
