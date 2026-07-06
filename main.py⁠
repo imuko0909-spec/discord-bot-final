@@ -22,8 +22,10 @@ RECEPTION_CHANNEL_ID = 1521453980268498974
 KNOCK_TEXT_CHANNEL_NAME = "ノック"
 RECRUIT_CHANNEL_NAME = "なう募集"
 ADMIN_LOG_CHANNEL_NAME = "管理ログ"
+STATUS_CHANNEL_NAME = "VC状況"
 
 EMPTY_DELETE_SECONDS = 30
+ROOM_CREATE_COOLDOWN_SECONDS = 60
 
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 if not TOKEN:
@@ -46,6 +48,8 @@ intents.message_content = True
 
 rooms = {}
 empty_delete_tasks = {}
+room_create_cooldowns = {}
+status_message_ids = {}
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "bot_data.db")
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -94,6 +98,18 @@ def init_db():
         )
     """)
 
+
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS active_rooms (
+            channel_id INTEGER PRIMARY KEY,
+            guild_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            room_type TEXT NOT NULL,
+            base_name TEXT NOT NULL,
+            log_id INTEGER
+        )
+    """)
 
     db.execute("""
         CREATE TABLE IF NOT EXISTS guild_config (
@@ -331,6 +347,242 @@ async def update_room_name(channel: discord.VoiceChannel):
         traceback.print_exc()
 
 
+
+
+def save_active_room(channel_id: int, guild_id: int, owner_id: int, room_type: str, base_name: str, log_id: int | None):
+    db.execute(
+        """
+        INSERT OR REPLACE INTO active_rooms
+        (channel_id, guild_id, owner_id, room_type, base_name, log_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (channel_id, guild_id, owner_id, room_type, base_name, log_id),
+    )
+    db.commit()
+
+
+def remove_active_room(channel_id: int):
+    db.execute("DELETE FROM active_rooms WHERE channel_id=?", (channel_id,))
+    db.commit()
+
+
+def can_create_room(guild_id: int, user_id: int):
+    if user_id == MY_USER_ID:
+        return True, 0
+
+    key = (guild_id, user_id)
+    now = int(time.time())
+    last = room_create_cooldowns.get(key, 0)
+    remain = ROOM_CREATE_COOLDOWN_SECONDS - (now - last)
+
+    if remain > 0:
+        return False, remain
+
+    room_create_cooldowns[key] = now
+    return True, 0
+
+
+async def get_or_create_status_channel(guild: discord.Guild):
+    configured_id = get_config_channel_id(guild.id, "status_channel_id", 0)
+    if configured_id:
+        channel = guild.get_channel(configured_id)
+        if isinstance(channel, discord.TextChannel):
+            return channel
+
+    channel = discord.utils.get(guild.text_channels, name=STATUS_CHANNEL_NAME)
+    if channel:
+        return channel
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            read_message_history=True,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_channels=True,
+            read_message_history=True,
+        ),
+    }
+
+    return await guild.create_text_channel(STATUS_CHANNEL_NAME, overwrites=overwrites)
+
+
+async def update_status_panel(guild: discord.Guild):
+    try:
+        channel = await get_or_create_status_channel(guild)
+
+        active_room_items = []
+        total_members = 0
+
+        for channel_id, room in rooms.items():
+            vc = guild.get_channel(channel_id)
+            if not isinstance(vc, discord.VoiceChannel):
+                continue
+
+            owner = guild.get_member(room.get("owner_id"))
+            total_members += len(vc.members)
+
+            type_text = "🔐 ノック" if room.get("type") == "knock" else ("🎫 招待制" if room.get("type") == "invite" else "🔓 貸切")
+            active_room_items.append(
+                f"{type_text} {vc.mention} / {len(vc.members)}人 / 部屋主: {owner.mention if owner else '不明'}"
+            )
+
+        embed = discord.Embed(
+            title="🎙 VC稼働状況",
+            color=discord.Color.blurple(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="現在の個室数", value=f"{len(active_room_items)}部屋", inline=True)
+        embed.add_field(name="個室内人数", value=f"{total_members}人", inline=True)
+        embed.add_field(
+            name="稼働中の部屋",
+            value="\\n".join(active_room_items[:20]) if active_room_items else "（なし）",
+            inline=False,
+        )
+
+        old_id = status_message_ids.get(guild.id)
+        if old_id:
+            try:
+                msg = await channel.fetch_message(old_id)
+                await msg.edit(embed=embed)
+                return
+            except discord.HTTPException:
+                pass
+
+        msg = await channel.send(embed=embed)
+        status_message_ids[guild.id] = msg.id
+
+    except Exception:
+        traceback.print_exc()
+
+
+async def log_voice_move(member: discord.Member, channel: discord.VoiceChannel, action: str):
+    try:
+        guild = channel.guild
+        embed = discord.Embed(
+            title="🚪 VC入退室ログ",
+            color=discord.Color.blue() if action == "入室" else discord.Color.dark_grey(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="メンバー", value=f"{member.mention}\\nID: `{member.id}`", inline=True)
+        embed.add_field(name="操作", value=action, inline=True)
+        embed.add_field(name="部屋", value=f"{channel.mention}\\n`{channel.name}`", inline=False)
+        await send_admin_log(guild, embed)
+    except Exception:
+        traceback.print_exc()
+
+
+async def transfer_room_owner_if_needed(channel: discord.VoiceChannel):
+    room = rooms.get(channel.id)
+    if not room:
+        return
+
+    owner_id = room.get("owner_id")
+    if any(m.id == owner_id for m in channel.members):
+        return
+
+    candidates = [m for m in channel.members if not m.bot]
+    if not candidates:
+        return
+
+    new_owner = candidates[0]
+    old_owner_id = owner_id
+
+    room["owner_id"] = new_owner.id
+    save_active_room(
+        channel.id,
+        channel.guild.id,
+        new_owner.id,
+        room.get("type", "free"),
+        room.get("base_name", channel.name),
+        room.get("log_id"),
+    )
+
+    try:
+        await channel.set_permissions(
+            new_owner,
+            view_channel=True,
+            connect=True,
+            speak=True,
+            manage_channels=True,
+            move_members=True,
+            mute_members=True,
+            deafen_members=True,
+        )
+    except discord.HTTPException:
+        pass
+
+    embed = discord.Embed(
+        title="👑 部屋主引き継ぎ",
+        color=discord.Color.gold(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="部屋", value=f"{channel.mention}\\n`{channel.name}`", inline=False)
+    embed.add_field(name="旧部屋主ID", value=f"`{old_owner_id}`", inline=True)
+    embed.add_field(name="新部屋主", value=f"{new_owner.mention}\\nID: `{new_owner.id}`", inline=True)
+
+    await send_admin_log(channel.guild, embed)
+
+
+async def restore_active_rooms():
+    await bot.wait_until_ready()
+
+    try:
+        cur = db.execute(
+            "SELECT channel_id, guild_id, owner_id, room_type, base_name, log_id FROM active_rooms"
+        )
+        rows = cur.fetchall()
+
+        for channel_id, guild_id, owner_id, room_type, base_name, log_id in rows:
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                remove_active_room(channel_id)
+                continue
+
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.VoiceChannel):
+                remove_active_room(channel_id)
+                continue
+
+            text_channel = await get_or_create_knock_text_channel(guild)
+
+            rooms[channel_id] = {
+                "owner_id": owner_id,
+                "type": room_type,
+                "base_name": base_name,
+                "knock_text_channel_id": text_channel.id,
+                "message_ids": [],
+                "log_id": log_id,
+            }
+
+            embed = discord.Embed(
+                title="🔄 復元された部屋 管理パネル",
+                description=(
+                    f"部屋: {channel.mention}\\n"
+                    f"部屋主: <@{owner_id}>\\n\\n"
+                    f"Bot再起動後に復元されました。"
+                ),
+                color=discord.Color.blurple(),
+            )
+            msg = await text_channel.send(embed=embed, view=RoomManageView(channel.id))
+            rooms[channel_id]["message_ids"] = [msg.id]
+
+            await update_room_name(channel)
+
+            if len(channel.members) == 0:
+                schedule_empty_delete(channel.id, guild)
+
+        for guild in bot.guilds:
+            await update_status_panel(guild)
+
+        print(f"✅ 稼働中の部屋を {len(rows)} 件復元しました。")
+
+    except Exception:
+        traceback.print_exc()
+
 def find_owned_room_id(guild: discord.Guild, owner_id: int):
     for channel_id, room in rooms.items():
         if room.get("owner_id") == owner_id and guild.get_channel(channel_id):
@@ -409,6 +661,7 @@ class MyBot(commands.Bot):
 
     async def setup_hook(self):
         self.add_view(MainVCPanelView())
+        self.loop.create_task(restore_active_rooms())
 
     async def on_ready(self):
         if not self.synced:
@@ -1178,6 +1431,8 @@ async def create_free_room(guild: discord.Guild, member: discord.Member, categor
     rooms[channel.id]["message_ids"] = [msg.id]
 
     await update_room_name(channel)
+    save_active_room(channel.id, guild.id, member.id, "free", rooms[channel.id]["base_name"], log_id)
+    await update_status_panel(guild)
     await log_room_created(guild, member, channel, "free")
 
     return channel
@@ -1237,6 +1492,8 @@ async def create_knock_room(guild: discord.Guild, member: discord.Member, catego
     rooms[channel.id]["message_ids"] = [msg.id]
 
     await update_room_name(channel)
+    save_active_room(channel.id, guild.id, member.id, "knock", rooms[channel.id]["base_name"], log_id)
+    await update_status_panel(guild)
     await log_room_created(guild, member, channel, "knock")
 
     return channel
@@ -1296,6 +1553,8 @@ async def create_invite_room(guild: discord.Guild, member: discord.Member, categ
     rooms[channel.id]["message_ids"] = [msg.id]
 
     await update_room_name(channel)
+    save_active_room(channel.id, guild.id, member.id, "invite", rooms[channel.id]["base_name"], log_id)
+    await update_status_panel(guild)
     await log_room_created(guild, member, channel, "invite")
 
     return channel
@@ -1308,6 +1567,9 @@ class MainVCPanelView(discord.ui.View):
     @discord.ui.button(label="🔑 ノック部屋作成", style=discord.ButtonStyle.secondary, custom_id="knock_room_create")
     async def knock_create(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
+            ok, remain = can_create_room(interaction.guild.id, interaction.user.id)
+            if not ok:
+                return await safe_reply(interaction, f"連続作成制限中です。あと {remain}秒待ってください。")
             category = interaction.channel.category if interaction.channel else None
             channel = await create_knock_room(interaction.guild, interaction.user, category)
 
@@ -1331,6 +1593,9 @@ class MainVCPanelView(discord.ui.View):
     @discord.ui.button(label="🔓 貸切部屋作成", style=discord.ButtonStyle.success, custom_id="free_room_create")
     async def free_create(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
+            ok, remain = can_create_room(interaction.guild.id, interaction.user.id)
+            if not ok:
+                return await safe_reply(interaction, f"連続作成制限中です。あと {remain}秒待ってください。")
             category = interaction.channel.category if interaction.channel else None
             channel = await create_free_room(interaction.guild, interaction.user, category)
 
@@ -1351,6 +1616,9 @@ class MainVCPanelView(discord.ui.View):
     @discord.ui.button(label="🎫 招待制部屋作成", style=discord.ButtonStyle.primary, custom_id="invite_room_create")
     async def invite_create(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
+            ok, remain = can_create_room(interaction.guild.id, interaction.user.id)
+            if not ok:
+                return await safe_reply(interaction, f"連続作成制限中です。あと {remain}秒待ってください。")
             category = interaction.channel.category if interaction.channel else None
             channel = await create_invite_room(interaction.guild, interaction.user, category)
 
@@ -1810,6 +2078,51 @@ async def set_recruit_channel(interaction: discord.Interaction, channel: discord
 
 
 
+
+@bot.tree.command(name="admin_dashboard", description="現在の個室一覧と管理情報を見る")
+async def admin_dashboard(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    lines = []
+
+    for channel_id, room in rooms.items():
+        channel = interaction.guild.get_channel(channel_id)
+        if not isinstance(channel, discord.VoiceChannel):
+            continue
+
+        owner = interaction.guild.get_member(room.get("owner_id"))
+        type_text = "🔐 ノック" if room.get("type") == "knock" else ("🎫 招待制" if room.get("type") == "invite" else "🔓 貸切")
+        members = ", ".join(m.display_name for m in channel.members) or "なし"
+
+        lines.append(
+            f"{type_text} {channel.mention}\\n"
+            f"部屋主: {owner.mention if owner else '不明'} / 人数: {len(channel.members)}\\n"
+            f"メンバー: {members}"
+        )
+
+    embed = discord.Embed(
+        title="📋 管理ダッシュボード",
+        color=discord.Color.blurple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="現在の個室数", value=f"{len(lines)}部屋", inline=True)
+    embed.add_field(
+        name="個室一覧",
+        value="\\n\\n".join(lines[:10]) if lines else "（なし）",
+        inline=False,
+    )
+
+    if len(lines) > 10:
+        embed.set_footer(text=f"他 {len(lines) - 10}部屋があります。")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+
 # =========================================================
 # VC入退室イベント
 # =========================================================
@@ -1829,7 +2142,9 @@ async def on_voice_state_update(member: discord.Member, before, after):
 
     if after.channel and after.channel.id in rooms:
         cancel_empty_delete(after.channel.id)
+        await log_voice_move(member, after.channel, "入室")
         await update_room_name(after.channel)
+        await update_status_panel(after.channel.guild)
 
     reception_id = get_config_channel_id(after.channel.guild.id, "reception_channel_id", RECEPTION_CHANNEL_ID) if after.channel else RECEPTION_CHANNEL_ID
 
@@ -1841,7 +2156,10 @@ async def on_voice_state_update(member: discord.Member, before, after):
             traceback.print_exc()
 
     if before.channel and before.channel.id in rooms:
+        await log_voice_move(member, before.channel, "退出")
+        await transfer_room_owner_if_needed(before.channel)
         await update_room_name(before.channel)
+        await update_status_panel(before.channel.guild)
         if len(before.channel.members) == 0:
             schedule_empty_delete(before.channel.id, before.channel.guild)
 
