@@ -4,14 +4,20 @@ from discord.ext import commands
 import asyncio
 import sqlite3
 import os
+import time
 import traceback
+
+# =========================================================
+# 設定
+# =========================================================
 
 MY_USER_ID = 1232865763094827112
 RECEPTION_CHANNEL_ID = 1521453980268498974
 
 KNOCK_TEXT_CHANNEL_NAME = "ノック"
 RECRUIT_CHANNEL_NAME = "なう募集"
-ROOM_TIME = 600
+
+ROOM_TIME = 600  # 10分
 
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 if not TOKEN:
@@ -28,6 +34,10 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "bot_data.db")
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
+# =========================================================
+# DB
+# =========================================================
+
 def init_db():
     db.execute("""
         CREATE TABLE IF NOT EXISTS user_lists (
@@ -37,6 +47,37 @@ def init_db():
             PRIMARY KEY (owner_id, list_type, target_id)
         )
     """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS user_stats (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            vc_created INTEGER DEFAULT 0,
+            knock_rooms INTEGER DEFAULT 0,
+            free_rooms INTEGER DEFAULT 0,
+            knocks_sent INTEGER DEFAULT 0,
+            knocks_received INTEGER DEFAULT 0,
+            knocks_allowed INTEGER DEFAULT 0,
+            knocks_denied INTEGER DEFAULT 0,
+            recruit_count INTEGER DEFAULT 0,
+            extend_count INTEGER DEFAULT 0,
+            total_seconds INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS room_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            room_type TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            duration_seconds INTEGER DEFAULT 0
+        )
+    """)
+
     db.commit()
 
 
@@ -74,8 +115,72 @@ def get_list(owner_id, list_type):
     return [row[0] for row in cur.fetchall()]
 
 
+def add_stat(guild_id, user_id, column, amount=1):
+    allowed = {
+        "vc_created", "knock_rooms", "free_rooms",
+        "knocks_sent", "knocks_received", "knocks_allowed",
+        "knocks_denied", "recruit_count", "extend_count",
+        "total_seconds"
+    }
+
+    if column not in allowed:
+        return
+
+    db.execute(
+        "INSERT OR IGNORE INTO user_stats (guild_id, user_id) VALUES (?, ?)",
+        (guild_id, user_id)
+    )
+    db.execute(
+        f"UPDATE user_stats SET {column} = {column} + ? WHERE guild_id=? AND user_id=?",
+        (amount, guild_id, user_id)
+    )
+    db.commit()
+
+
+def create_room_log(guild_id, owner_id, room_type):
+    now = int(time.time())
+    cur = db.execute(
+        "INSERT INTO room_logs (guild_id, owner_id, room_type, created_at) VALUES (?, ?, ?, ?)",
+        (guild_id, owner_id, room_type, now)
+    )
+    db.commit()
+    return cur.lastrowid
+
+
+def finish_room_log(log_id, guild_id, owner_id):
+    if not log_id:
+        return
+
+    cur = db.execute("SELECT created_at, ended_at FROM room_logs WHERE id=?", (log_id,))
+    row = cur.fetchone()
+    if not row or row[1] is not None:
+        return
+
+    now = int(time.time())
+    duration = max(0, now - row[0])
+
+    db.execute(
+        "UPDATE room_logs SET ended_at=?, duration_seconds=? WHERE id=?",
+        (now, duration, log_id)
+    )
+    db.commit()
+
+    add_stat(guild_id, owner_id, "total_seconds", duration)
+
+
+def format_seconds(seconds):
+    seconds = int(seconds or 0)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    return f"{hours}時間{minutes}分"
+
+
 init_db()
 
+
+# =========================================================
+# Bot
+# =========================================================
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -134,6 +239,10 @@ async def safe_reply(interaction, content, ephemeral=True):
         traceback.print_exc()
 
 
+# =========================================================
+# 共通
+# =========================================================
+
 async def get_or_create_knock_text_channel(guild: discord.Guild):
     channel = discord.utils.get(guild.text_channels, name=KNOCK_TEXT_CHANNEL_NAME)
     if channel:
@@ -170,11 +279,10 @@ async def delete_room(channel_id: int, guild: discord.Guild):
     if room:
         text_channel_id = room.get("knock_text_channel_id")
         message_ids = room.get("message_ids", [])
-
         text_ch = guild.get_channel(text_channel_id) if text_channel_id else None
 
         if text_ch:
-            for msg_id in message_ids:
+            for msg_id in list(message_ids):
                 try:
                     msg = await text_ch.fetch_message(msg_id)
                     await msg.delete()
@@ -184,6 +292,8 @@ async def delete_room(channel_id: int, guild: discord.Guild):
                     pass
                 except Exception:
                     traceback.print_exc()
+
+        finish_room_log(room.get("log_id"), guild.id, room.get("owner_id"))
 
     channel = guild.get_channel(channel_id)
     if channel:
@@ -198,6 +308,10 @@ async def delete_room(channel_id: int, guild: discord.Guild):
 
     rooms.pop(channel_id, None)
 
+
+# =========================================================
+# マイリスト
+# =========================================================
 
 class ActionView(discord.ui.View):
     def __init__(self, target):
@@ -305,6 +419,10 @@ async def mylist_menu(interaction, member: discord.Member):
     )
 
 
+# =========================================================
+# ノック機能
+# =========================================================
+
 class KnockDecisionView(discord.ui.View):
     def __init__(self, channel_id, requester_id):
         super().__init__(timeout=180)
@@ -328,6 +446,7 @@ class KnockDecisionView(discord.ui.View):
                 return await safe_reply(interaction, "対象が見つかりません。")
 
             await channel.set_permissions(member, view_channel=True, connect=True, speak=True)
+            add_stat(interaction.guild.id, room["owner_id"], "knocks_allowed")
 
             try:
                 if member.voice and member.voice.channel:
@@ -351,7 +470,9 @@ class KnockDecisionView(discord.ui.View):
             if interaction.user.id != room["owner_id"] and interaction.user.id != MY_USER_ID:
                 return await safe_reply(interaction, "部屋主だけ操作できます。")
 
+            add_stat(interaction.guild.id, room["owner_id"], "knocks_denied")
             member = interaction.guild.get_member(self.requester_id)
+
             await safe_reply(interaction, f"❌ {member.display_name if member else '相手'} さんを拒否しました。")
 
         except Exception:
@@ -383,8 +504,12 @@ class KnockButtonView(discord.ui.View):
             if is_in_list(owner.id, "blacklist", interaction.user.id):
                 return await safe_reply(interaction, "この部屋にはノックできません。")
 
+            add_stat(interaction.guild.id, interaction.user.id, "knocks_sent")
+            add_stat(interaction.guild.id, owner.id, "knocks_received")
+
             if is_in_list(owner.id, "favorites", interaction.user.id):
                 await channel.set_permissions(interaction.user, view_channel=True, connect=True, speak=True)
+                add_stat(interaction.guild.id, owner.id, "knocks_allowed")
                 return await safe_reply(interaction, "❤️ お気に入り登録されているため、入室許可されました。")
 
             text_channel = interaction.guild.get_channel(room["knock_text_channel_id"])
@@ -406,6 +531,10 @@ class KnockButtonView(discord.ui.View):
             traceback.print_exc()
             await safe_reply(interaction, "ノック処理でエラーが発生しました。")
 
+
+# =========================================================
+# 部屋管理
+# =========================================================
 
 class RenameRoomModal(discord.ui.Modal, title="部屋名変更"):
     new_name = discord.ui.TextInput(label="新しい部屋名", max_length=80)
@@ -500,6 +629,7 @@ class RoomManageView(discord.ui.View):
         if not await self.owner_check(interaction):
             return
         rooms[self.channel_id]["time"] += 600
+        add_stat(interaction.guild.id, interaction.user.id, "extend_count")
         await safe_reply(interaction, f"10分延長しました。残り {rooms[self.channel_id]['time'] // 60}分")
 
     @discord.ui.button(label="🗑 部屋削除", style=discord.ButtonStyle.danger)
@@ -509,6 +639,10 @@ class RoomManageView(discord.ui.View):
         await safe_reply(interaction, "部屋を削除します。")
         await delete_room(self.channel_id, interaction.guild)
 
+
+# =========================================================
+# 部屋作成
+# =========================================================
 
 async def room_timer(channel_id, guild):
     while channel_id in rooms:
@@ -544,13 +678,19 @@ async def create_free_room(guild, member, category):
         overwrites=overwrites
     )
 
+    log_id = create_room_log(guild.id, member.id, "free")
+
     rooms[channel.id] = {
         "owner_id": member.id,
         "time": ROOM_TIME,
         "type": "free",
         "knock_text_channel_id": None,
-        "message_ids": []
+        "message_ids": [],
+        "log_id": log_id
     }
+
+    add_stat(guild.id, member.id, "vc_created")
+    add_stat(guild.id, member.id, "free_rooms")
 
     text_channel = await get_or_create_knock_text_channel(guild)
 
@@ -589,13 +729,19 @@ async def create_knock_room(guild, member, category):
         overwrites=overwrites
     )
 
+    log_id = create_room_log(guild.id, member.id, "knock")
+
     rooms[channel.id] = {
         "owner_id": member.id,
         "time": ROOM_TIME,
         "type": "knock",
         "knock_text_channel_id": None,
-        "message_ids": []
+        "message_ids": [],
+        "log_id": log_id
     }
+
+    add_stat(guild.id, member.id, "vc_created")
+    add_stat(guild.id, member.id, "knock_rooms")
 
     text_channel = await get_or_create_knock_text_channel(guild)
 
@@ -680,6 +826,10 @@ async def setupvc(interaction):
     )
 
 
+# =========================================================
+# 募集
+# =========================================================
+
 class RecruitView(discord.ui.View):
     def __init__(self, author_id):
         super().__init__(timeout=None)
@@ -719,6 +869,7 @@ class RecruitTargetView(discord.ui.View):
         embed.set_footer(text=f"募集主: {interaction.user.display_name}")
 
         await channel.send(embed=embed, view=RecruitView(self.author_id))
+        add_stat(interaction.guild.id, interaction.user.id, "recruit_count")
         await safe_reply(interaction, "募集を送信しました。")
 
     @discord.ui.button(label="男性宛", style=discord.ButtonStyle.primary)
@@ -745,6 +896,154 @@ async def bosyu(interaction):
         ephemeral=True
     )
 
+
+# =========================================================
+# 履歴・ランキング・統計
+# =========================================================
+
+@bot.tree.command(name="history", description="自分の利用履歴を見る")
+async def history(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    cur = db.execute(
+        """
+        SELECT vc_created, knock_rooms, free_rooms, knocks_sent, knocks_received,
+               knocks_allowed, knocks_denied, recruit_count, extend_count, total_seconds
+        FROM user_stats
+        WHERE guild_id=? AND user_id=?
+        """,
+        (interaction.guild.id, interaction.user.id)
+    )
+    row = cur.fetchone()
+
+    if not row:
+        return await safe_reply(interaction, "まだ利用履歴がありません。")
+
+    embed = discord.Embed(
+        title=f"📊 {interaction.user.display_name} さんの利用履歴",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(name="🎤 VC作成回数", value=f"{row[0]}回", inline=True)
+    embed.add_field(name="🔑 ノック部屋", value=f"{row[1]}回", inline=True)
+    embed.add_field(name="🔓 貸切部屋", value=f"{row[2]}回", inline=True)
+    embed.add_field(name="🚪 ノック送信", value=f"{row[3]}回", inline=True)
+    embed.add_field(name="📩 ノック受信", value=f"{row[4]}回", inline=True)
+    embed.add_field(name="✅ 許可", value=f"{row[5]}回", inline=True)
+    embed.add_field(name="❌ 拒否", value=f"{row[6]}回", inline=True)
+    embed.add_field(name="📢 募集", value=f"{row[7]}回", inline=True)
+    embed.add_field(name="⏰ 延長", value=f"{row[8]}回", inline=True)
+    embed.add_field(name="⏱ 合計利用時間", value=format_seconds(row[9]), inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="ranking", description="VC利用ランキングを見る")
+async def ranking(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    cur = db.execute(
+        """
+        SELECT user_id, vc_created, total_seconds
+        FROM user_stats
+        WHERE guild_id=?
+        ORDER BY vc_created DESC, total_seconds DESC
+        LIMIT 10
+        """,
+        (interaction.guild.id,)
+    )
+
+    rows = cur.fetchall()
+
+    if not rows:
+        return await safe_reply(interaction, "まだランキングデータがありません。")
+
+    lines = []
+    medals = ["🥇", "🥈", "🥉"]
+
+    for i, row in enumerate(rows):
+        user_id, vc_created, total_seconds = row
+        member = interaction.guild.get_member(user_id)
+        name = member.display_name if member else f"退出済み ID:{user_id}"
+        mark = medals[i] if i < 3 else f"{i+1}位"
+        lines.append(
+            f"{mark} **{name}**\n"
+            f"　🎤 作成 {vc_created}回 / ⏱ {format_seconds(total_seconds)}"
+        )
+
+    embed = discord.Embed(
+        title="🏆 VC利用ランキング",
+        description="\n\n".join(lines),
+        color=discord.Color.gold()
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="server_stats", description="サーバー全体の利用統計を見る")
+async def server_stats(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    if not interaction.user.guild_permissions.manage_guild and interaction.user.id != MY_USER_ID:
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    cur = db.execute(
+        """
+        SELECT
+            SUM(vc_created),
+            SUM(knock_rooms),
+            SUM(free_rooms),
+            SUM(knocks_sent),
+            SUM(knocks_received),
+            SUM(knocks_allowed),
+            SUM(knocks_denied),
+            SUM(recruit_count),
+            SUM(extend_count),
+            SUM(total_seconds),
+            COUNT(*)
+        FROM user_stats
+        WHERE guild_id=?
+        """,
+        (interaction.guild.id,)
+    )
+
+    row = cur.fetchone()
+
+    if not row or row[10] == 0:
+        return await safe_reply(interaction, "まだ統計データがありません。")
+
+    active_rooms = sum(
+        1 for channel_id in rooms.keys()
+        if interaction.guild.get_channel(channel_id)
+    )
+
+    embed = discord.Embed(
+        title="👑 サーバー利用統計",
+        color=discord.Color.green()
+    )
+
+    embed.add_field(name="現在の個室", value=f"{active_rooms}部屋", inline=True)
+    embed.add_field(name="利用者数", value=f"{row[10]}人", inline=True)
+    embed.add_field(name="🎤 VC作成", value=f"{row[0] or 0}回", inline=True)
+    embed.add_field(name="🔑 ノック部屋", value=f"{row[1] or 0}回", inline=True)
+    embed.add_field(name="🔓 貸切部屋", value=f"{row[2] or 0}回", inline=True)
+    embed.add_field(name="🚪 ノック送信", value=f"{row[3] or 0}回", inline=True)
+    embed.add_field(name="📩 ノック受信", value=f"{row[4] or 0}回", inline=True)
+    embed.add_field(name="✅ 許可", value=f"{row[5] or 0}回", inline=True)
+    embed.add_field(name="❌ 拒否", value=f"{row[6] or 0}回", inline=True)
+    embed.add_field(name="📢 募集", value=f"{row[7] or 0}回", inline=True)
+    embed.add_field(name="⏰ 延長", value=f"{row[8] or 0}回", inline=True)
+    embed.add_field(name="⏱ 合計利用時間", value=format_seconds(row[9] or 0), inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# =========================================================
+# 受付VC自動作成・空室削除
+# =========================================================
 
 @bot.event
 async def on_voice_state_update(member, before, after):
