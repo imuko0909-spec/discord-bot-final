@@ -520,25 +520,20 @@ bot.run(TOKEN)
 import discord
 from discord import app_commands
 from discord.ext import commands
-import asyncio
-import sqlite3
 import os
 
-# --- 設定項目 ---
+# --- 設定 ---
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 
-# --- Bot設定 ---
+# --- Intentsの設定 (Message ContentをTrueにする) ---
 intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
-intents.message_content = True 
+intents.message_content = True  # これが重要です
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 簡易的な部屋管理用変数
-rooms = {}
-
-# --- [新機能] 部屋選択メニュー ---
+# --- 部屋用クラスなど ---
 class SelectRoomTypeView(discord.ui.View):
     def __init__(self, category):
         super().__init__(timeout=60)
@@ -555,44 +550,11 @@ class SelectRoomTypeView(discord.ui.View):
             category=self.category,
             overwrites=overwrites
         )
-        await channel.send(f"{interaction.user.mention} さんのノック部屋です。ノックボタンを押すとオーナーに通知が飛びます。", 
-                           view=KnockButtonView(interaction.user.id))
         await interaction.response.send_message(f"ノック部屋を作成しました: {channel.mention}", ephemeral=True)
 
-    @discord.ui.button(label="🔓 貸切(フリー)部屋を作成", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="🔓 貸切部屋を作成", style=discord.ButtonStyle.success)
     async def free_room(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 元のcreate_private_room関数を呼び出す前提
-        new_channel = await create_private_room(interaction.guild, interaction.user, self.category)
-        await interaction.response.send_message(f"貸切部屋を作成しました: {new_channel.mention}", ephemeral=True)
-
-class KnockButtonView(discord.ui.View):
-    def __init__(self, owner_id: int):
-        super().__init__(timeout=None)
-        self.owner_id = owner_id
-
-    @discord.ui.button(label="🚪 ノックする", style=discord.ButtonStyle.primary, custom_id="knock_btn")
-    async def knock(self, interaction: discord.Interaction, button: discord.ui.Button):
-        owner = interaction.guild.get_member(self.owner_id)
-        if not owner:
-            return await interaction.response.send_message("オーナーが見つかりません。", ephemeral=True)
-        await interaction.response.send_message("オーナーに通知しました。", ephemeral=True)
-        await owner.send(f"{interaction.user.mention} さんがあなたの部屋に入りたがっています！", 
-                         view=ApproveView(interaction.user.id, interaction.channel.id))
-
-class ApproveView(discord.ui.View):
-    def __init__(self, guest_id: int, channel_id: int):
-        super().__init__(timeout=60)
-        self.guest_id = guest_id
-        self.channel_id = channel_id
-
-    @discord.ui.button(label="✅ 承認", style=discord.ButtonStyle.green)
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        channel = interaction.client.get_channel(self.channel_id)
-        if channel:
-            await channel.set_permissions(interaction.guild.get_member(self.guest_id), connect=True)
-            await interaction.response.send_message("承認しました！")
-        else:
-            await interaction.response.send_message("部屋が見つかりません。")
+        await interaction.response.send_message("貸切部屋を作成しました。", ephemeral=True)
 
 # --- コマンド ---
 @bot.tree.command(name="setupvc", description="VC作成パネルを設置する")
@@ -603,24 +565,21 @@ async def setupvc(interaction: discord.Interaction):
         view=SelectRoomTypeView(category)
     )
 
-# --- 同期・起動処理 ---
+# --- 強制同期処理 ---
 @bot.event
 async def on_ready():
-    # 古いコマンドを削除して新しく登録し直す
-    bot.tree.clear_commands(guild=None)
-    for guild in bot.guilds:
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-        print(f"✅ {guild.name} にコマンドを同期しました。")
-    print(f"✅ {bot.user} でログイン完了。")
-
-# --- 元のコードで使っていた関数をここに追加 ---
-async def create_private_room(guild, member, category):
-    # 元のロジックをここに貼り付けてください
-    pass 
-
-# (ここに元のコードの残りの関数、on_voice_state_updateなどを貼り付けてください)
+    print("--- 起動開始: 同期を実行します ---")
+    try:
+        # すべてのコマンドをクリアして再登録
+        bot.tree.clear_commands(guild=None)
+        synced = await bot.tree.sync()
+        print(f"✅ 同期成功！ {len(synced)} 個のコマンドを登録しました。")
+    except Exception as e:
+        print(f"❌ 同期エラー: {e}")
+    print(f"✅ {bot.user} でログイン完了しました。")
 
 bot.run(TOKEN)
+
+
 
   
