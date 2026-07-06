@@ -21,7 +21,7 @@ MY_USER_ID = 1232865763094827112
 RECEPTION_CHANNEL_ID = 1521453980268498974
 
 KNOCK_TEXT_CHANNEL_NAME = "ノック"
-RECRUIT_CHANNEL_NAME = "なう募集"
+RECRUIT_CHANNEL_NAME = "雑談募集"
 ADMIN_LOG_CHANNEL_NAME = "管理ログ"
 STATUS_CHANNEL_NAME = "VC状況"
 
@@ -1745,30 +1745,36 @@ async def uninvite_member(interaction: discord.Interaction, member: discord.Memb
 # 募集
 # =========================================================
 
-class RecruitView(discord.ui.View):
+
+class ChatRecruitJoinView(discord.ui.View):
     def __init__(self, author_id: int):
         super().__init__(timeout=None)
         self.author_id = author_id
 
-    @discord.ui.button(label="立候補する", style=discord.ButtonStyle.green)
-    async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="参加する", style=discord.ButtonStyle.green)
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id == self.author_id:
-            return await safe_reply(interaction, "自分の募集には立候補できません。")
+            return await safe_reply(interaction, "自分の募集には参加できません。")
 
         author = interaction.guild.get_member(self.author_id)
         if author:
             try:
-                await author.send(f"📩 {interaction.user.display_name} さんが立候補しました！")
+                await author.send(
+                    "📩 **雑談募集に参加希望がありました！**\n\n"
+                    f"参加者: **{interaction.user.display_name}**\n"
+                    f"サーバー: **{interaction.guild.name}**"
+                )
             except discord.HTTPException:
                 pass
 
-        await safe_reply(interaction, "立候補しました！")
+        await safe_reply(interaction, "募集主に参加希望を送りました！")
 
 
-class RecruitTargetView(discord.ui.View):
-    def __init__(self, author_id: int):
+class ChatRecruitTargetView(discord.ui.View):
+    def __init__(self, author_id: int, recruit_type: str):
         super().__init__(timeout=60)
         self.author_id = author_id
+        self.recruit_type = recruit_type
 
     async def send_recruit(self, interaction: discord.Interaction, target: str):
         configured_id = get_config_channel_id(interaction.guild.id, "recruit_channel_id", 0)
@@ -1780,13 +1786,6 @@ class RecruitTargetView(discord.ui.View):
         if not channel:
             channel = await interaction.guild.create_text_channel(RECRUIT_CHANNEL_NAME)
 
-        embed = discord.Embed(
-            title="📢 募集通知",
-            description=f"{target}の方、立候補をお待ちしています！",
-            color=discord.Color.green(),
-        )
-        embed.set_footer(text=f"募集主: {interaction.user.display_name}")
-
         male_role = interaction.guild.get_role(get_config_channel_id(interaction.guild.id, "male_role_id", 0))
         female_role = interaction.guild.get_role(get_config_channel_id(interaction.guild.id, "female_role_id", 0))
 
@@ -1795,42 +1794,108 @@ class RecruitTargetView(discord.ui.View):
             mentions.append(male_role.mention)
         elif target == "女性" and female_role:
             mentions.append(female_role.mention)
-        elif target == "男性・女性":
+        elif target == "誰でも":
             if male_role:
                 mentions.append(male_role.mention)
             if female_role:
                 mentions.append(female_role.mention)
 
+        emoji_map = {
+            "雑談": "💬",
+            "ゲーム": "🎮",
+            "恋愛相談": "💕",
+            "深夜雑談": "🌙",
+            "作業通話": "🎤",
+        }
+        target_emoji = "👨" if target == "男性" else ("👩" if target == "女性" else "👥")
+        type_emoji = emoji_map.get(self.recruit_type, "💬")
+
+        embed = discord.Embed(
+            title=f"{type_emoji} {self.recruit_type}募集",
+            description=(
+                f"募集主: {interaction.user.mention}\n"
+                f"募集対象: {target_emoji} **{target}**\n\n"
+                "気軽に参加してください✨"
+            ),
+            color=discord.Color.green(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_footer(text=f"募集主: {interaction.user.display_name}")
+
         await channel.send(
             content=" ".join(mentions) if mentions else None,
             embed=embed,
-            view=RecruitView(self.author_id),
+            view=ChatRecruitJoinView(self.author_id),
             allowed_mentions=discord.AllowedMentions(roles=True)
         )
-        add_stat(interaction.guild.id, interaction.user.id, "recruit_count")
-        await safe_reply(interaction, "募集を送信しました。")
 
-    @discord.ui.button(label="男性宛", style=discord.ButtonStyle.primary)
+        add_stat(interaction.guild.id, interaction.user.id, "recruit_count")
+        await safe_reply(interaction, f"`#{channel.name}` に募集を投稿しました。")
+
+    @discord.ui.button(label="👨 男性募集", style=discord.ButtonStyle.primary)
     async def men(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.send_recruit(interaction, "男性")
 
-    @discord.ui.button(label="女性宛", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="👩 女性募集", style=discord.ButtonStyle.primary)
     async def women(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.send_recruit(interaction, "女性")
 
-    @discord.ui.button(label="両方宛", style=discord.ButtonStyle.secondary)
-    async def both(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.send_recruit(interaction, "男性・女性")
+    @discord.ui.button(label="👥 誰でも募集", style=discord.ButtonStyle.secondary)
+    async def everyone(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.send_recruit(interaction, "誰でも")
 
 
-@bot.tree.command(name="募集", description="なう募集へ通知")
+class ChatRecruitTypeSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="雑談", emoji="💬", description="普通にお話したいとき"),
+            discord.SelectOption(label="ゲーム", emoji="🎮", description="一緒にゲームしたいとき"),
+            discord.SelectOption(label="恋愛相談", emoji="💕", description="恋愛相談したいとき"),
+            discord.SelectOption(label="深夜雑談", emoji="🌙", description="夜にまったり話したいとき"),
+            discord.SelectOption(label="作業通話", emoji="🎤", description="作業しながら話したいとき"),
+        ]
+        super().__init__(
+            placeholder="募集内容を選んでください",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        recruit_type = self.values[0]
+        await interaction.response.send_message(
+            f"募集対象を選んでください。\n内容: **{recruit_type}**",
+            view=ChatRecruitTargetView(interaction.user.id, recruit_type),
+            ephemeral=True
+        )
+
+
+class ChatRecruitTypeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.add_item(ChatRecruitTypeSelect())
+
+
+@bot.tree.command(name="雑談募集", description="雑談・ゲーム・相談などの募集を出す")
+async def chat_recruit(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    await interaction.response.send_message(
+        "募集内容を選んでください。",
+        view=ChatRecruitTypeView(),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="募集", description="雑談募集を出す")
 async def bosyu(interaction: discord.Interaction):
     if interaction.guild is None:
         return await safe_reply(interaction, "サーバー内で使ってください。")
 
     await interaction.response.send_message(
-        "募集先を選んでください。",
-        view=RecruitTargetView(interaction.user.id),
+        "募集内容を選んでください。",
+        view=ChatRecruitTypeView(),
         ephemeral=True,
     )
 
