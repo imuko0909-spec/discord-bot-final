@@ -94,6 +94,16 @@ def init_db():
         )
     """)
 
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS guild_config (
+            guild_id INTEGER NOT NULL,
+            config_key TEXT NOT NULL,
+            config_value TEXT NOT NULL,
+            PRIMARY KEY (guild_id, config_key)
+        )
+    """)
+
     db.execute("""
         CREATE TABLE IF NOT EXISTS user_activity (
             guild_id INTEGER NOT NULL,
@@ -239,6 +249,93 @@ def format_last_seen(timestamp_value: int | None) -> str:
         return f"{diff // 3600}時間前"
 
     return f"{diff // 86400}日前"
+
+
+
+
+def set_config(guild_id: int, key: str, value: str):
+    db.execute(
+        """
+        INSERT INTO guild_config (guild_id, config_key, config_value)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, config_key)
+        DO UPDATE SET config_value=excluded.config_value
+        """,
+        (guild_id, key, str(value)),
+    )
+    db.commit()
+
+
+def get_config(guild_id: int, key: str, default=None):
+    cur = db.execute(
+        "SELECT config_value FROM guild_config WHERE guild_id=? AND config_key=?",
+        (guild_id, key),
+    )
+    row = cur.fetchone()
+    return row[0] if row else default
+
+
+def get_config_channel_id(guild_id: int, key: str, default_id: int = 0):
+    value = get_config(guild_id, key, None)
+    if value is None:
+        return default_id
+    try:
+        return int(value)
+    except Exception:
+        return default_id
+
+
+def make_bar(value: int, max_value: int, width: int = 12):
+    if max_value <= 0:
+        return "░" * width
+    filled = max(0, min(width, round((value / max_value) * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def get_room_prefix(room_type: str):
+    if room_type == "knock":
+        return "🔐"
+    if room_type == "invite":
+        return "🎫"
+    return "🔓"
+
+
+def build_room_name(base_name: str, channel: discord.VoiceChannel):
+    limit = channel.user_limit
+    now_count = len(channel.members)
+    limit_text = str(limit) if limit else "∞"
+
+    clean = base_name
+    if "【" in clean:
+        clean = clean.split("【", 1)[0]
+
+    return f"{clean}【{now_count}/{limit_text}】"[:100]
+
+
+async def update_room_name(channel: discord.VoiceChannel):
+    room = rooms.get(channel.id)
+    if not room:
+        return
+
+    base_name = room.get("base_name") or channel.name.split("【", 1)[0]
+    new_name = build_room_name(base_name, channel)
+
+    if channel.name == new_name:
+        return
+
+    try:
+        await channel.edit(name=new_name)
+    except discord.HTTPException:
+        pass
+    except Exception:
+        traceback.print_exc()
+
+
+def find_owned_room_id(guild: discord.Guild, owner_id: int):
+    for channel_id, room in rooms.items():
+        if room.get("owner_id") == owner_id and guild.get_channel(channel_id):
+            return channel_id
+    return None
 
 
 def get_activity_lists(guild: discord.Guild, active_days: int = 7, limit: int = 15):
@@ -447,7 +544,7 @@ async def log_room_created(
     channel: discord.VoiceChannel,
     room_type: str,
 ):
-    room_type_text = "🔐 ノック部屋" if room_type == "knock" else "🔓 貸切部屋"
+    room_type_text = "🔐 ノック部屋" if room_type == "knock" else ("🎫 招待制部屋" if room_type == "invite" else "🔓 貸切部屋")
 
     embed = discord.Embed(
         title="🟢 部屋作成ログ",
@@ -473,7 +570,7 @@ async def log_room_deleted(
 
     owner = guild.get_member(room.get("owner_id"))
     room_type = room.get("type")
-    room_type_text = "🔐 ノック部屋" if room_type == "knock" else "🔓 貸切部屋"
+    room_type_text = "🔐 ノック部屋" if room_type == "knock" else ("🎫 招待制部屋" if room_type == "invite" else "🔓 貸切部屋")
 
     log_id = room.get("log_id")
     duration_text = "不明"
@@ -928,7 +1025,11 @@ class RenameRoomModal(discord.ui.Modal, title="部屋名変更"):
         if not channel:
             return await safe_reply(interaction, "部屋が見つかりません。")
 
+        room = rooms.get(self.channel_id)
+        if room:
+            room["base_name"] = str(self.new_name)
         await channel.edit(name=str(self.new_name))
+        await update_room_name(channel)
         await safe_reply(interaction, "部屋名を変更しました。")
 
 
@@ -955,6 +1056,7 @@ class LimitRoomModal(discord.ui.Modal, title="人数制限変更"):
             return await safe_reply(interaction, "部屋が見つかりません。")
 
         await channel.edit(user_limit=value)
+        await update_room_name(channel)
         await safe_reply(interaction, f"人数制限を {value} に変更しました。")
 
 
@@ -1037,8 +1139,9 @@ async def create_free_room(guild: discord.Guild, member: discord.Member, categor
         ),
     }
 
+    base_name = f"🔓{member.display_name}の貸切部屋"
     channel = await guild.create_voice_channel(
-        name=f"🔓{member.display_name}の貸切部屋",
+        name=base_name,
         category=category,
         overwrites=overwrites,
     )
@@ -1048,6 +1151,7 @@ async def create_free_room(guild: discord.Guild, member: discord.Member, categor
     rooms[channel.id] = {
         "owner_id": member.id,
         "type": "free",
+        "base_name": base_name,
         "knock_text_channel_id": None,
         "message_ids": [],
         "log_id": log_id,
@@ -1073,6 +1177,7 @@ async def create_free_room(guild: discord.Guild, member: discord.Member, categor
     rooms[channel.id]["knock_text_channel_id"] = text_channel.id
     rooms[channel.id]["message_ids"] = [msg.id]
 
+    await update_room_name(channel)
     await log_room_created(guild, member, channel, "free")
 
     return channel
@@ -1092,8 +1197,9 @@ async def create_knock_room(guild: discord.Guild, member: discord.Member, catego
         ),
     }
 
+    base_name = f"🔐{member.display_name}のノック部屋"
     channel = await guild.create_voice_channel(
-        name=f"🔐{member.display_name}のノック部屋",
+        name=base_name,
         category=category,
         overwrites=overwrites,
     )
@@ -1103,6 +1209,7 @@ async def create_knock_room(guild: discord.Guild, member: discord.Member, catego
     rooms[channel.id] = {
         "owner_id": member.id,
         "type": "knock",
+        "base_name": base_name,
         "knock_text_channel_id": None,
         "message_ids": [],
         "log_id": log_id,
@@ -1129,7 +1236,67 @@ async def create_knock_room(guild: discord.Guild, member: discord.Member, catego
     rooms[channel.id]["knock_text_channel_id"] = text_channel.id
     rooms[channel.id]["message_ids"] = [msg.id]
 
+    await update_room_name(channel)
     await log_room_created(guild, member, channel, "knock")
+
+    return channel
+
+
+
+async def create_invite_room(guild: discord.Guild, member: discord.Member, category):
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
+        member: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            manage_channels=True,
+            move_members=True,
+            mute_members=True,
+            deafen_members=True,
+        ),
+    }
+
+    base_name = f"🎫{member.display_name}の招待制部屋"
+    channel = await guild.create_voice_channel(
+        name=base_name,
+        category=category,
+        overwrites=overwrites,
+    )
+
+    log_id = create_room_log(guild.id, member.id, "invite")
+
+    rooms[channel.id] = {
+        "owner_id": member.id,
+        "type": "invite",
+        "base_name": base_name,
+        "knock_text_channel_id": None,
+        "message_ids": [],
+        "log_id": log_id,
+    }
+
+    add_stat(guild.id, member.id, "vc_created")
+
+    text_channel = await get_or_create_knock_text_channel(guild)
+
+    embed = discord.Embed(
+        title="🎫 招待制部屋 管理パネル",
+        description=(
+            f"部屋主: {member.mention}\n"
+            f"部屋: {channel.mention}\n\n"
+            f"このメッセージは管理用です。\n"
+            f"招待は `/invite_member` から行えます。"
+        ),
+        color=discord.Color.orange(),
+    )
+
+    msg = await text_channel.send(embed=embed, view=RoomManageView(channel.id))
+
+    rooms[channel.id]["knock_text_channel_id"] = text_channel.id
+    rooms[channel.id]["message_ids"] = [msg.id]
+
+    await update_room_name(channel)
+    await log_room_created(guild, member, channel, "invite")
 
     return channel
 
@@ -1181,6 +1348,30 @@ class MainVCPanelView(discord.ui.View):
             await safe_reply(interaction, "貸切部屋作成でエラーが発生しました。")
 
 
+    @discord.ui.button(label="🎫 招待制部屋作成", style=discord.ButtonStyle.primary, custom_id="invite_room_create")
+    async def invite_create(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            category = interaction.channel.category if interaction.channel else None
+            channel = await create_invite_room(interaction.guild, interaction.user, category)
+
+            if interaction.user.voice and interaction.user.voice.channel:
+                try:
+                    await interaction.user.move_to(channel)
+                except discord.HTTPException:
+                    pass
+
+            await safe_reply(
+                interaction,
+                f"🎫 招待制部屋を作成しました: {channel.mention}\n"
+                f"部屋主は `/invite_member` で招待できます。",
+            )
+        except discord.Forbidden:
+            await safe_reply(interaction, "Botの権限が足りません。チャンネル管理・メンバー移動権限を確認してください。")
+        except Exception:
+            traceback.print_exc()
+            await safe_reply(interaction, "招待制部屋作成でエラーが発生しました。")
+
+
 @bot.tree.command(name="setupvc", description="VC作成パネルを設置")
 async def setupvc(interaction: discord.Interaction):
     if interaction.guild is None:
@@ -1190,6 +1381,68 @@ async def setupvc(interaction: discord.Interaction):
         "作成する部屋タイプを選んでください。",
         view=MainVCPanelView(),
     )
+
+
+
+@bot.tree.command(name="invite_member", description="自分の個室にメンバーを招待する")
+@app_commands.describe(member="招待するメンバー")
+async def invite_member(interaction: discord.Interaction, member: discord.Member):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    channel_id = find_owned_room_id(interaction.guild, interaction.user.id)
+    if not channel_id:
+        return await safe_reply(interaction, "あなたが作成した部屋が見つかりません。")
+
+    channel = interaction.guild.get_channel(channel_id)
+    if not channel:
+        return await safe_reply(interaction, "部屋が見つかりません。")
+
+    if member.bot:
+        return await safe_reply(interaction, "Botは招待できません。")
+
+    if is_in_list(interaction.user.id, "blacklist", member.id):
+        return await safe_reply(interaction, "ブラックリストのメンバーは招待できません。")
+
+    await channel.set_permissions(member, view_channel=True, connect=True, speak=True)
+
+    try:
+        await member.send(
+            f"🎫 **{interaction.guild.name}** の **{channel.name}** に招待されました。"
+        )
+    except discord.HTTPException:
+        pass
+
+    await safe_reply(interaction, f"{member.display_name} さんを招待しました。")
+
+
+@bot.tree.command(name="uninvite_member", description="自分の個室からメンバーの招待を解除する")
+@app_commands.describe(member="招待解除するメンバー")
+async def uninvite_member(interaction: discord.Interaction, member: discord.Member):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    channel_id = find_owned_room_id(interaction.guild, interaction.user.id)
+    if not channel_id:
+        return await safe_reply(interaction, "あなたが作成した部屋が見つかりません。")
+
+    channel = interaction.guild.get_channel(channel_id)
+    if not channel:
+        return await safe_reply(interaction, "部屋が見つかりません。")
+
+    if member.id == interaction.user.id:
+        return await safe_reply(interaction, "自分自身は解除できません。")
+
+    await channel.set_permissions(member, overwrite=None)
+
+    try:
+        if member.voice and member.voice.channel and member.voice.channel.id == channel.id:
+            await member.move_to(None)
+    except discord.HTTPException:
+        pass
+
+    await safe_reply(interaction, f"{member.display_name} さんの招待を解除しました。")
+
 
 
 # =========================================================
@@ -1222,7 +1475,11 @@ class RecruitTargetView(discord.ui.View):
         self.author_id = author_id
 
     async def send_recruit(self, interaction: discord.Interaction, target: str):
-        channel = discord.utils.get(interaction.guild.text_channels, name=RECRUIT_CHANNEL_NAME)
+        configured_id = get_config_channel_id(interaction.guild.id, "recruit_channel_id", 0)
+        channel = interaction.guild.get_channel(configured_id) if configured_id else None
+
+        if not isinstance(channel, discord.TextChannel):
+            channel = discord.utils.get(interaction.guild.text_channels, name=RECRUIT_CHANNEL_NAME)
 
         if not channel:
             channel = await interaction.guild.create_text_channel(RECRUIT_CHANNEL_NAME)
@@ -1425,6 +1682,134 @@ async def server_stats(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+
+# =========================================================
+# 利用グラフ・管理者設定
+# =========================================================
+
+@bot.tree.command(name="usage_graph", description="日別のVC利用グラフを見る")
+@app_commands.describe(days="表示する日数 1〜30")
+async def usage_graph(interaction: discord.Interaction, days: int = 7):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    days = max(1, min(30, days))
+    now = int(time.time())
+    start = now - days * 86400
+
+    cur = db.execute(
+        """
+        SELECT created_at
+        FROM room_logs
+        WHERE guild_id=? AND created_at>=?
+        """,
+        (interaction.guild.id, start),
+    )
+    rows = cur.fetchall()
+
+    buckets = []
+    for i in range(days):
+        day_start = now - (days - i) * 86400
+        day_end = day_start + 86400
+        label = time.strftime("%m/%d", time.localtime(day_start))
+        count = sum(1 for (created_at,) in rows if day_start <= created_at < day_end)
+        buckets.append((label, count))
+
+    max_count = max([c for _, c in buckets] or [0])
+    lines = [
+        f"`{label}` {make_bar(count, max_count)} {count}回"
+        for label, count in buckets
+    ]
+
+    embed = discord.Embed(
+        title=f"📈 VC利用グラフ（直近{days}日）",
+        description="\n".join(lines) if lines else "データがありません。",
+        color=discord.Color.blurple(),
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
+def admin_config_check(interaction: discord.Interaction):
+    return interaction.user.guild_permissions.manage_guild or interaction.user.id == MY_USER_ID
+
+
+@bot.tree.command(name="config_show", description="Bot設定を見る")
+async def config_show(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    guild = interaction.guild
+    reception_id = get_config_channel_id(guild.id, "reception_channel_id", RECEPTION_CHANNEL_ID)
+    knock_id = get_config_channel_id(guild.id, "knock_channel_id", 0)
+    admin_log_id = get_config_channel_id(guild.id, "admin_log_channel_id", 0)
+    recruit_id = get_config_channel_id(guild.id, "recruit_channel_id", 0)
+
+    def ch_text(channel_id, default_name):
+        channel = guild.get_channel(channel_id) if channel_id else None
+        return channel.mention if channel else f"未設定（既定: {default_name}）"
+
+    embed = discord.Embed(title="⚙️ Bot設定", color=discord.Color.blurple())
+    embed.add_field(name="受付VC", value=ch_text(reception_id, "設定ID"), inline=False)
+    embed.add_field(name="ノック管理チャンネル", value=ch_text(knock_id, KNOCK_TEXT_CHANNEL_NAME), inline=False)
+    embed.add_field(name="管理ログチャンネル", value=ch_text(admin_log_id, ADMIN_LOG_CHANNEL_NAME), inline=False)
+    embed.add_field(name="募集チャンネル", value=ch_text(recruit_id, RECRUIT_CHANNEL_NAME), inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="set_reception_vc", description="受付VCを設定する")
+@app_commands.describe(channel="受付に使うVC")
+async def set_reception_vc(interaction: discord.Interaction, channel: discord.VoiceChannel):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(interaction.guild.id, "reception_channel_id", str(channel.id))
+    await safe_reply(interaction, f"受付VCを {channel.mention} に設定しました。")
+
+
+@bot.tree.command(name="set_knock_channel", description="ノック管理パネル用チャンネルを設定する")
+@app_commands.describe(channel="管理パネルを出すテキストチャンネル")
+async def set_knock_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(interaction.guild.id, "knock_channel_id", str(channel.id))
+    await safe_reply(interaction, f"ノック管理チャンネルを {channel.mention} に設定しました。")
+
+
+@bot.tree.command(name="set_admin_log_channel", description="管理ログチャンネルを設定する")
+@app_commands.describe(channel="管理ログを送るテキストチャンネル")
+async def set_admin_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(interaction.guild.id, "admin_log_channel_id", str(channel.id))
+    await safe_reply(interaction, f"管理ログチャンネルを {channel.mention} に設定しました。")
+
+
+@bot.tree.command(name="set_recruit_channel", description="募集チャンネルを設定する")
+@app_commands.describe(channel="募集を送るテキストチャンネル")
+async def set_recruit_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(interaction.guild.id, "recruit_channel_id", str(channel.id))
+    await safe_reply(interaction, f"募集チャンネルを {channel.mention} に設定しました。")
+
+
+
 # =========================================================
 # VC入退室イベント
 # =========================================================
@@ -1444,8 +1829,11 @@ async def on_voice_state_update(member: discord.Member, before, after):
 
     if after.channel and after.channel.id in rooms:
         cancel_empty_delete(after.channel.id)
+        await update_room_name(after.channel)
 
-    if RECEPTION_CHANNEL_ID and after.channel and after.channel.id == RECEPTION_CHANNEL_ID:
+    reception_id = get_config_channel_id(after.channel.guild.id, "reception_channel_id", RECEPTION_CHANNEL_ID) if after.channel else RECEPTION_CHANNEL_ID
+
+    if reception_id and after.channel and after.channel.id == reception_id:
         try:
             channel = await create_free_room(after.channel.guild, member, after.channel.category)
             await member.move_to(channel)
@@ -1453,6 +1841,7 @@ async def on_voice_state_update(member: discord.Member, before, after):
             traceback.print_exc()
 
     if before.channel and before.channel.id in rooms:
+        await update_room_name(before.channel)
         if len(before.channel.members) == 0:
             schedule_empty_delete(before.channel.id, before.channel.guild)
 
