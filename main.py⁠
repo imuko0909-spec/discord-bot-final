@@ -476,6 +476,155 @@ async def cleanup_old_status_messages(channel: discord.TextChannel, keep_message
         traceback.print_exc()
 
 
+
+# =========================================================
+# 雑談募集システム 修正ヘルパー
+# =========================================================
+
+def get_user_voice_channel(member: discord.Member):
+    if member.voice and member.voice.channel:
+        return member.voice.channel
+    return None
+
+
+def get_recruit_role_mentions(guild: discord.Guild, recruit_type: str, target: str):
+    is_night = recruit_type == "深夜雑談"
+
+    if is_night:
+        male_key = "night_male_role_id"
+        female_key = "night_female_role_id"
+    else:
+        male_key = "male_role_id"
+        female_key = "female_role_id"
+
+    male_role = guild.get_role(get_config_channel_id(guild.id, male_key, 0))
+    female_role = guild.get_role(get_config_channel_id(guild.id, female_key, 0))
+
+    mentions = []
+
+    if target == "男性":
+        if male_role:
+            mentions.append(male_role.mention)
+    elif target == "女性":
+        if female_role:
+            mentions.append(female_role.mention)
+    else:
+        if male_role:
+            mentions.append(male_role.mention)
+        if female_role:
+            mentions.append(female_role.mention)
+
+    return " ".join(mentions)
+
+
+def create_recruit_log(guild_id: int, author_id: int, recruit_type: str, target: str, vc_channel_id: int | None):
+    now = int(time.time())
+    cur = db.execute(
+        """
+        INSERT INTO recruit_logs
+        (guild_id, author_id, recruit_type, target, vc_channel_id, created_at, is_active)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+        """,
+        (guild_id, author_id, recruit_type, target, vc_channel_id, now),
+    )
+    db.commit()
+    return cur.lastrowid
+
+
+def update_recruit_log_message(log_id: int, channel_id: int, message_id: int):
+    db.execute(
+        "UPDATE recruit_logs SET channel_id=?, message_id=? WHERE id=?",
+        (channel_id, message_id, log_id),
+    )
+    db.commit()
+
+
+def finish_recruit_log(log_id: int | None):
+    if not log_id:
+        return
+
+    now = int(time.time())
+    db.execute(
+        "UPDATE recruit_logs SET ended_at=?, is_active=0 WHERE id=? AND is_active=1",
+        (now, log_id),
+    )
+    db.commit()
+
+
+def get_active_recruit_count(guild_id: int):
+    try:
+        cur = db.execute(
+            "SELECT COUNT(*) FROM recruit_logs WHERE guild_id=? AND is_active=1",
+            (guild_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+async def end_recruit(guild: discord.Guild, author_id: int, reason: str = "募集終了"):
+    data = active_recruits.pop((guild.id, author_id), None)
+
+    if not data:
+        try:
+            cur = db.execute(
+                """
+                SELECT id, channel_id, message_id
+                FROM recruit_logs
+                WHERE guild_id=? AND author_id=? AND is_active=1
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (guild.id, author_id),
+            )
+            row = cur.fetchone()
+            if row:
+                data = {
+                    "log_id": row[0],
+                    "channel_id": row[1],
+                    "message_id": row[2],
+                }
+        except sqlite3.Error:
+            data = None
+
+    if not data:
+        return False
+
+    finish_recruit_log(data.get("log_id"))
+
+    channel = guild.get_channel(data.get("channel_id"))
+    if isinstance(channel, discord.TextChannel):
+        try:
+            msg = await channel.fetch_message(data.get("message_id"))
+            old_embed = msg.embeds[0] if msg.embeds else None
+
+            embed = discord.Embed(
+                title="🔴 募集終了",
+                description="この募集は終了しました。",
+                color=discord.Color.dark_grey(),
+                timestamp=discord.utils.utcnow(),
+            )
+
+            if old_embed:
+                for field in old_embed.fields:
+                    embed.add_field(name=field.name, value=field.value, inline=field.inline)
+                embed.set_footer(text=reason)
+
+            await msg.edit(content=None, embed=embed, view=None)
+        except discord.HTTPException:
+            pass
+        except Exception:
+            traceback.print_exc()
+
+    try:
+        await update_status_panel(guild)
+    except Exception:
+        pass
+
+    return True
+
+
 async def update_status_panel(guild: discord.Guild):
     try:
         channel = await get_or_create_status_channel(guild)
