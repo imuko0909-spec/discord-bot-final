@@ -52,6 +52,7 @@ empty_delete_tasks = {}
 room_create_cooldowns = {}
 status_message_ids = {}
 relay_sessions = {}
+active_recruits = {}
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "bot_data.db")
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -145,6 +146,22 @@ def init_db():
             config_key TEXT NOT NULL,
             config_value TEXT NOT NULL,
             PRIMARY KEY (guild_id, config_key)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS recruit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            author_id INTEGER NOT NULL,
+            channel_id INTEGER,
+            message_id INTEGER,
+            recruit_type TEXT NOT NULL,
+            target TEXT NOT NULL,
+            vc_channel_id INTEGER,
+            created_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            is_active INTEGER DEFAULT 1
         )
     """)
 
@@ -506,6 +523,7 @@ async def update_status_panel(guild: discord.Guild):
         embed.add_field(name="🟢 オンライン目安", value=f"{online_count}人", inline=True)
         embed.add_field(name="🎤 VC利用者", value=f"{total_members}人", inline=True)
         embed.add_field(name="稼働中の個室", value=f"{len(active_room_items)}部屋", inline=True)
+        embed.add_field(name="💬 募集中", value=f"{get_active_recruit_count(guild.id)}件", inline=True)
         embed.add_field(
             name="📺 VC一覧",
             value="\\n\\n".join(active_room_items[:10]) if active_room_items else "（現在稼働中の個室はありません）",
@@ -1790,29 +1808,6 @@ async def uninvite_member(interaction: discord.Interaction, member: discord.Memb
 # =========================================================
 
 
-class ChatRecruitJoinView(discord.ui.View):
-    def __init__(self, author_id: int):
-        super().__init__(timeout=None)
-        self.author_id = author_id
-
-    @discord.ui.button(label="参加する", style=discord.ButtonStyle.green)
-    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id == self.author_id:
-            return await safe_reply(interaction, "自分の募集には参加できません。")
-
-        author = interaction.guild.get_member(self.author_id)
-        if author:
-            try:
-                await author.send(
-                    "📩 **雑談募集に参加希望がありました！**\n\n"
-                    f"参加者: **{interaction.user.display_name}**\n"
-                    f"サーバー: **{interaction.guild.name}**"
-                )
-            except discord.HTTPException:
-                pass
-
-        await safe_reply(interaction, "募集主に参加希望を送りました！")
-
 
 class ChatRecruitTargetView(discord.ui.View):
     def __init__(self, author_id: int, recruit_type: str):
@@ -1821,6 +1816,10 @@ class ChatRecruitTargetView(discord.ui.View):
         self.recruit_type = recruit_type
 
     async def send_recruit(self, interaction: discord.Interaction, target: str):
+        key = (interaction.guild.id, interaction.user.id)
+        if key in active_recruits:
+            return await safe_reply(interaction, "すでに募集中です。先に `/募集終了` で終了してください。")
+
         configured_id = get_config_channel_id(interaction.guild.id, "recruit_channel_id", 0)
         channel = interaction.guild.get_channel(configured_id) if configured_id else None
 
@@ -1830,19 +1829,8 @@ class ChatRecruitTargetView(discord.ui.View):
         if not channel:
             channel = await interaction.guild.create_text_channel(RECRUIT_CHANNEL_NAME)
 
-        male_role = interaction.guild.get_role(get_config_channel_id(interaction.guild.id, "male_role_id", 0))
-        female_role = interaction.guild.get_role(get_config_channel_id(interaction.guild.id, "female_role_id", 0))
-
-        mentions = []
-        if target == "男性" and male_role:
-            mentions.append(male_role.mention)
-        elif target == "女性" and female_role:
-            mentions.append(female_role.mention)
-        elif target == "誰でも":
-            if male_role:
-                mentions.append(male_role.mention)
-            if female_role:
-                mentions.append(female_role.mention)
+        vc_channel = get_user_voice_channel(interaction.user)
+        role_mentions = get_recruit_role_mentions(interaction.guild, self.recruit_type, target)
 
         emoji_map = {
             "雑談": "💬",
@@ -1851,29 +1839,53 @@ class ChatRecruitTargetView(discord.ui.View):
             "深夜雑談": "🌙",
             "作業通話": "🎤",
         }
+
         target_emoji = "👨" if target == "男性" else ("👩" if target == "女性" else "👥")
         type_emoji = emoji_map.get(self.recruit_type, "💬")
 
+        log_id = create_recruit_log(
+            interaction.guild.id,
+            interaction.user.id,
+            self.recruit_type,
+            target,
+            vc_channel.id if vc_channel else None,
+        )
+
         embed = discord.Embed(
-            title=f"{type_emoji} {self.recruit_type}募集",
+            title=f"🟢 {type_emoji} {self.recruit_type}募集",
             description=(
-                f"募集主: {interaction.user.mention}\n"
-                f"募集対象: {target_emoji} **{target}**\n\n"
-                "気軽に参加してください✨"
+                f"👤 募集主: {interaction.user.mention}\n"
+                f"🎙 VC: {vc_channel.mention if vc_channel else 'VC未参加'}\n"
+                f"👥 募集対象: {target_emoji} **{target}**\n\n"
+                f"VCへ直接参加してください✨"
             ),
             color=discord.Color.green(),
             timestamp=discord.utils.utcnow(),
         )
         embed.set_footer(text=f"募集主: {interaction.user.display_name}")
 
-        await channel.send(
-            content=" ".join(mentions) if mentions else None,
+        msg = await channel.send(
+            content=role_mentions if role_mentions else None,
             embed=embed,
-            view=ChatRecruitJoinView(self.author_id),
-            allowed_mentions=discord.AllowedMentions(roles=True)
+            allowed_mentions=discord.AllowedMentions(roles=True),
         )
 
+        update_recruit_log_message(log_id, channel.id, msg.id)
+
+        active_recruits[key] = {
+            "log_id": log_id,
+            "channel_id": channel.id,
+            "message_id": msg.id,
+            "vc_channel_id": vc_channel.id if vc_channel else None,
+        }
+
         add_stat(interaction.guild.id, interaction.user.id, "recruit_count")
+
+        try:
+            await update_status_panel(interaction.guild)
+        except Exception:
+            pass
+
         await safe_reply(interaction, f"`#{channel.name}` に募集を投稿しました。")
 
     @discord.ui.button(label="👨 男性募集", style=discord.ButtonStyle.primary)
@@ -1902,7 +1914,7 @@ class ChatRecruitTypeSelect(discord.ui.Select):
             placeholder="募集内容を選んでください",
             min_values=1,
             max_values=1,
-            options=options
+            options=options,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1910,7 +1922,7 @@ class ChatRecruitTypeSelect(discord.ui.Select):
         await interaction.response.send_message(
             f"募集対象を選んでください。\n内容: **{recruit_type}**",
             view=ChatRecruitTargetView(interaction.user.id, recruit_type),
-            ephemeral=True
+            ephemeral=True,
         )
 
 
@@ -1942,6 +1954,18 @@ async def bosyu(interaction: discord.Interaction):
         view=ChatRecruitTypeView(),
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="募集終了", description="自分の募集を終了する")
+async def recruit_end(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    ended = await end_recruit(interaction.guild, interaction.user.id, reason="手動で募集終了")
+    if ended:
+        await safe_reply(interaction, "募集を終了しました。")
+    else:
+        await safe_reply(interaction, "現在有効な募集はありません。")
 
 
 # =========================================================
@@ -2308,6 +2332,31 @@ async def set_female_role(interaction: discord.Interaction, role: discord.Role):
     await safe_reply(interaction, f"女性募集ロールを {role.mention} に設定しました。")
 
 
+
+@bot.tree.command(name="set_night_male_role", description="深夜男性募集で通知するロールを設定する")
+@app_commands.describe(role="深夜男性募集でメンションするロール")
+async def set_night_male_role(interaction: discord.Interaction, role: discord.Role):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(interaction.guild.id, "night_male_role_id", str(role.id))
+    await safe_reply(interaction, f"深夜男性募集ロールを {role.mention} に設定しました。")
+
+
+@bot.tree.command(name="set_night_female_role", description="深夜女性募集で通知するロールを設定する")
+@app_commands.describe(role="深夜女性募集でメンションするロール")
+async def set_night_female_role(interaction: discord.Interaction, role: discord.Role):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(interaction.guild.id, "night_female_role_id", str(role.id))
+    await safe_reply(interaction, f"深夜女性募集ロールを {role.mention} に設定しました。")
+
+
 @bot.tree.command(name="relay_config", description="個室リレーの設定をする")
 @app_commands.describe(
     waiting_vc="待機ブースにするVC",
@@ -2603,6 +2652,16 @@ async def on_voice_state_update(member: discord.Member, before, after):
             await member.move_to(channel)
         except Exception:
             traceback.print_exc()
+
+
+    try:
+        if before.channel:
+            data = active_recruits.get((before.channel.guild.id, member.id))
+            if data and data.get("vc_channel_id") == before.channel.id:
+                if not after.channel or after.channel.id != before.channel.id:
+                    await end_recruit(before.channel.guild, member.id, reason="募集主がVCから退出したため自動終了")
+    except Exception:
+        traceback.print_exc()
 
     if before.channel and before.channel.id in rooms:
         await log_voice_move(member, before.channel, "退出")
