@@ -22,6 +22,9 @@ RECEPTION_CHANNEL_ID = 1521453980268498974
 
 KNOCK_TEXT_CHANNEL_NAME = "ノック"
 RECRUIT_CHANNEL_NAME = "雑談募集"
+ANON_PROFILE_CHANNEL_NAME = "匿名プロフィール"
+ANON_POST_CHANNEL_NAME = "匿名投稿"
+ANON_MATCH_THREAD_PREFIX = "匿名マッチ"
 ADMIN_LOG_CHANNEL_NAME = "管理ログ"
 STATUS_CHANNEL_NAME = "VC状況"
 
@@ -172,6 +175,47 @@ def init_db():
             last_seen INTEGER NOT NULL,
             action TEXT,
             PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS anon_profiles (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            profile_text TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS anon_profile_posts (
+            message_id INTEGER PRIMARY KEY,
+            guild_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS anon_profile_likes (
+            guild_id INTEGER NOT NULL,
+            liker_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, liker_id, target_id)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS anon_matches (
+            guild_id INTEGER NOT NULL,
+            user1_id INTEGER NOT NULL,
+            user2_id INTEGER NOT NULL,
+            thread_id INTEGER,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user1_id, user2_id)
         )
     """)
 
@@ -899,6 +943,10 @@ class MyBot(commands.Bot):
 
     async def setup_hook(self):
         self.add_view(MainVCPanelView())
+        try:
+            self.add_view(AnonProfileLikeView())
+        except NameError:
+            pass
         self.loop.create_task(restore_active_rooms())
 
     async def on_ready(self):
@@ -2819,6 +2867,482 @@ async def on_voice_state_update(member: discord.Member, before, after):
         await update_status_panel(before.channel.guild)
         if len(before.channel.members) == 0:
             schedule_empty_delete(before.channel.id, before.channel.guild)
+
+
+
+# =========================================================
+# 匿名プロフィール・匿名投稿・匿名マッチング
+# =========================================================
+
+async def get_or_create_anon_profile_channel(guild: discord.Guild):
+    channel_id = get_config_channel_id(guild.id, "anon_profile_channel_id", 0)
+    channel = guild.get_channel(channel_id) if channel_id else None
+    if isinstance(channel, discord.TextChannel):
+        return channel
+
+    channel = discord.utils.get(guild.text_channels, name=ANON_PROFILE_CHANNEL_NAME)
+    if channel:
+        return channel
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            read_message_history=True,
+            create_public_threads=False,
+            create_private_threads=False,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_channels=True,
+            manage_threads=True,
+            create_private_threads=True,
+            read_message_history=True,
+        ),
+    }
+    return await guild.create_text_channel(ANON_PROFILE_CHANNEL_NAME, overwrites=overwrites)
+
+
+async def get_or_create_anon_post_channel(guild: discord.Guild):
+    channel_id = get_config_channel_id(guild.id, "anon_post_channel_id", 0)
+    channel = guild.get_channel(channel_id) if channel_id else None
+    if isinstance(channel, discord.TextChannel):
+        return channel
+
+    channel = discord.utils.get(guild.text_channels, name=ANON_POST_CHANNEL_NAME)
+    if channel:
+        return channel
+
+    return await guild.create_text_channel(ANON_POST_CHANNEL_NAME)
+
+
+def set_anon_profile(guild_id: int, user_id: int, profile_text: str):
+    now = int(time.time())
+    db.execute(
+        """
+        INSERT INTO anon_profiles (guild_id, user_id, profile_text, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET profile_text=excluded.profile_text, updated_at=excluded.updated_at
+        """,
+        (guild_id, user_id, profile_text, now),
+    )
+    db.commit()
+
+
+def get_anon_profile(guild_id: int, user_id: int):
+    cur = db.execute(
+        "SELECT profile_text FROM anon_profiles WHERE guild_id=? AND user_id=?",
+        (guild_id, user_id),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def get_random_anon_profile(guild_id: int, exclude_user_id: int):
+    cur = db.execute(
+        """
+        SELECT user_id, profile_text
+        FROM anon_profiles
+        WHERE guild_id=? AND user_id<>?
+        ORDER BY RANDOM()
+        LIMIT 1
+        """,
+        (guild_id, exclude_user_id),
+    )
+    return cur.fetchone()
+
+
+def save_anon_profile_post(message_id: int, guild_id: int, channel_id: int, owner_id: int):
+    now = int(time.time())
+    db.execute(
+        """
+        INSERT OR REPLACE INTO anon_profile_posts
+        (message_id, guild_id, channel_id, owner_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (message_id, guild_id, channel_id, owner_id, now),
+    )
+    db.commit()
+
+
+def get_anon_post_owner(message_id: int):
+    cur = db.execute(
+        "SELECT guild_id, owner_id FROM anon_profile_posts WHERE message_id=?",
+        (message_id,),
+    )
+    return cur.fetchone()
+
+
+def save_anon_like(guild_id: int, liker_id: int, target_id: int):
+    now = int(time.time())
+    db.execute(
+        """
+        INSERT OR IGNORE INTO anon_profile_likes
+        (guild_id, liker_id, target_id, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (guild_id, liker_id, target_id, now),
+    )
+    db.commit()
+
+
+def has_anon_like(guild_id: int, liker_id: int, target_id: int):
+    cur = db.execute(
+        "SELECT 1 FROM anon_profile_likes WHERE guild_id=? AND liker_id=? AND target_id=?",
+        (guild_id, liker_id, target_id),
+    )
+    return cur.fetchone() is not None
+
+
+def normalize_pair(user1_id: int, user2_id: int):
+    return (user1_id, user2_id) if user1_id < user2_id else (user2_id, user1_id)
+
+
+def get_existing_anon_match(guild_id: int, user1_id: int, user2_id: int):
+    a, b = normalize_pair(user1_id, user2_id)
+    cur = db.execute(
+        "SELECT thread_id FROM anon_matches WHERE guild_id=? AND user1_id=? AND user2_id=?",
+        (guild_id, a, b),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def save_anon_match(guild_id: int, user1_id: int, user2_id: int, thread_id: int | None):
+    a, b = normalize_pair(user1_id, user2_id)
+    now = int(time.time())
+    db.execute(
+        """
+        INSERT OR IGNORE INTO anon_matches
+        (guild_id, user1_id, user2_id, thread_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (guild_id, a, b, thread_id, now),
+    )
+    db.commit()
+
+
+class AnonProfileLikeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="💗 気になる", style=discord.ButtonStyle.primary, custom_id="anon_profile_like")
+    async def like(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            return await safe_reply(interaction, "サーバー内で使ってください。")
+
+        owner_data = get_anon_post_owner(interaction.message.id)
+        if not owner_data:
+            return await safe_reply(interaction, "プロフィール情報が見つかりません。")
+
+        _guild_id, target_id = owner_data
+
+        if interaction.user.id == target_id:
+            return await safe_reply(interaction, "自分のプロフィールには押せません。")
+
+        save_anon_like(interaction.guild.id, interaction.user.id, target_id)
+
+        if has_anon_like(interaction.guild.id, target_id, interaction.user.id):
+            existing_thread_id = get_existing_anon_match(interaction.guild.id, interaction.user.id, target_id)
+            if existing_thread_id:
+                return await safe_reply(interaction, "すでにマッチ済みです。")
+
+            target = interaction.guild.get_member(target_id)
+            if not target:
+                return await safe_reply(interaction, "相手が見つかりません。")
+
+            try:
+                parent_channel = interaction.channel
+                thread = await parent_channel.create_thread(
+                    name=f"{ANON_MATCH_THREAD_PREFIX}-{interaction.user.display_name[:8]}",
+                    type=discord.ChannelType.private_thread,
+                    reason="匿名プロフィール相互リアクション",
+                )
+
+                await thread.add_user(interaction.user)
+                await thread.add_user(target)
+
+                await thread.send(
+                    "💞 **匿名プロフィールで相互マッチしました。**\n"
+                    "このスレッドは招待された2人だけで会話できます。\n"
+                    "ゆっくりお話してください。"
+                )
+
+                save_anon_match(interaction.guild.id, interaction.user.id, target_id, thread.id)
+
+                try:
+                    await interaction.user.send("💞 匿名プロフィールでマッチしました。非公開スレッドを確認してください。")
+                except discord.HTTPException:
+                    pass
+
+                try:
+                    await target.send("💞 匿名プロフィールでマッチしました。非公開スレッドを確認してください。")
+                except discord.HTTPException:
+                    pass
+
+                await safe_reply(interaction, "相互マッチしました！非公開スレッドを作成しました。")
+
+            except discord.Forbidden:
+                await safe_reply(interaction, "非公開スレッドを作成できませんでした。Botにスレッド管理権限を付けてください。")
+            except discord.HTTPException:
+                traceback.print_exc()
+                await safe_reply(interaction, "スレッド作成に失敗しました。")
+        else:
+            await safe_reply(interaction, "気になるを送りました。相互になると非公開スレッドが作成されます。")
+
+
+@bot.tree.command(name="anon_profile_set", description="匿名プロフィールを登録・更新する")
+@app_commands.describe(text="匿名プロフィール本文")
+async def anon_profile_set(interaction: discord.Interaction, text: str):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    set_anon_profile(interaction.guild.id, interaction.user.id, text)
+    await safe_reply(interaction, "匿名プロフィールを保存しました。")
+
+
+@bot.tree.command(name="anon_profile_post", description="自分の匿名プロフィールを投稿する")
+async def anon_profile_post(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    profile = get_anon_profile(interaction.guild.id, interaction.user.id)
+    if not profile:
+        return await safe_reply(interaction, "先に `/anon_profile_set` でプロフィールを登録してください。")
+
+    channel = await get_or_create_anon_profile_channel(interaction.guild)
+
+    embed = discord.Embed(
+        title="🕊 匿名プロフィール",
+        description=profile[:3500],
+        color=discord.Color.purple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text="気になる場合はボタンを押してください。相互になると非公開スレッドが作成されます。")
+
+    msg = await channel.send(embed=embed, view=AnonProfileLikeView())
+    save_anon_profile_post(msg.id, interaction.guild.id, channel.id, interaction.user.id)
+
+    await safe_reply(interaction, f"{channel.mention} に匿名プロフィールを投稿しました。")
+
+
+@bot.tree.command(name="anon_match", description="匿名プロフィールをランダムに表示する")
+async def anon_match(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    row = get_random_anon_profile(interaction.guild.id, interaction.user.id)
+    if not row:
+        return await safe_reply(interaction, "表示できる匿名プロフィールがまだありません。")
+
+    _target_id, profile_text = row
+
+    embed = discord.Embed(
+        title="🕊 匿名プロフィール",
+        description=profile_text[:3500],
+        color=discord.Color.purple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text="気になる場合は、匿名プロフィール一覧の投稿からボタンを押してください。")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="anon_post", description="匿名投稿をする")
+@app_commands.describe(text="匿名で投稿する内容")
+async def anon_post(interaction: discord.Interaction, text: str):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    channel = await get_or_create_anon_post_channel(interaction.guild)
+
+    embed = discord.Embed(
+        title="🕊 匿名投稿",
+        description=text[:3500],
+        color=discord.Color.dark_purple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text="匿名投稿")
+
+    await channel.send(embed=embed)
+    await safe_reply(interaction, f"{channel.mention} に匿名投稿しました。")
+
+
+@bot.tree.command(name="set_anon_profile_channel", description="匿名プロフィール投稿チャンネルを設定する")
+@app_commands.describe(channel="匿名プロフィールを投稿するチャンネル")
+async def set_anon_profile_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(interaction.guild.id, "anon_profile_channel_id", str(channel.id))
+    await safe_reply(interaction, f"匿名プロフィールチャンネルを {channel.mention} に設定しました。")
+
+
+@bot.tree.command(name="set_anon_post_channel", description="匿名投稿チャンネルを設定する")
+@app_commands.describe(channel="匿名投稿を送るチャンネル")
+async def set_anon_post_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(interaction.guild.id, "anon_post_channel_id", str(channel.id))
+    await safe_reply(interaction, f"匿名投稿チャンネルを {channel.mention} に設定しました。")
+
+
+# =========================================================
+# 匿名個室リレー
+# =========================================================
+
+async def run_anonymous_relay_session(guild: discord.Guild, starter_id: int):
+    session = relay_sessions.get(guild.id)
+    if not session:
+        return
+
+    waiting_vc = guild.get_channel(session["waiting_vc_id"])
+    if not isinstance(waiting_vc, discord.VoiceChannel):
+        relay_sessions.pop(guild.id, None)
+        return
+
+    rounds = session["rounds"]
+    round_seconds = session["round_seconds"]
+    break_seconds = session["break_seconds"]
+    category = waiting_vc.category
+
+    try:
+        for round_no in range(1, rounds + 1):
+            if not session.get("running"):
+                break
+
+            participants = [m for m in waiting_vc.members if not m.bot and m.id != starter_id]
+
+            if len(participants) < 2:
+                await send_admin_log(
+                    guild,
+                    discord.Embed(
+                        title="🕊 匿名個室リレー停止",
+                        description="参加者が2人未満のため停止しました。",
+                        color=discord.Color.red(),
+                        timestamp=discord.utils.utcnow(),
+                    )
+                )
+                break
+
+            random.shuffle(participants)
+            pairs = [participants[i:i+2] for i in range(0, len(participants), 2) if len(participants[i:i+2]) == 2]
+            created_channels = []
+
+            await send_admin_log(
+                guild,
+                discord.Embed(
+                    title=f"🕊 匿名個室リレー Round {round_no}/{rounds}",
+                    description=f"通話時間: {round_seconds}秒\n組数: {len(pairs)}組\n※VC内ではDiscord仕様上、参加者名は見えます。",
+                    color=discord.Color.purple(),
+                    timestamp=discord.utils.utcnow(),
+                )
+            )
+
+            for idx, pair in enumerate(pairs, start=1):
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
+                    guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True, manage_channels=True, move_members=True),
+                }
+                for member in pair:
+                    overwrites[member] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+
+                channel = await guild.create_voice_channel(
+                    name=f"🕊匿名リレー R{round_no}-{idx}",
+                    category=category,
+                    overwrites=overwrites,
+                )
+                created_channels.append(channel)
+
+                for member in pair:
+                    try:
+                        await member.move_to(channel)
+                    except discord.HTTPException:
+                        pass
+
+            await asyncio.sleep(round_seconds)
+
+            for channel in created_channels:
+                for member in list(channel.members):
+                    try:
+                        await member.move_to(waiting_vc)
+                    except discord.HTTPException:
+                        pass
+
+                try:
+                    await channel.delete()
+                except discord.HTTPException:
+                    pass
+
+            if round_no < rounds and session.get("running"):
+                await asyncio.sleep(break_seconds)
+
+        relay_sessions.pop(guild.id, None)
+
+        await send_admin_log(
+            guild,
+            discord.Embed(
+                title="✅ 匿名個室リレー終了",
+                description="匿名個室リレーが終了しました。",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow(),
+            )
+        )
+
+    except Exception:
+        traceback.print_exc()
+        relay_sessions.pop(guild.id, None)
+
+
+@bot.tree.command(name="anonymous_relay_start", description="匿名個室リレーを開始する")
+@app_commands.describe(rounds="今回だけ使うラウンド数。未指定なら設定値")
+async def anonymous_relay_start(interaction: discord.Interaction, rounds: int | None = None):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    if interaction.guild.id in relay_sessions:
+        return await safe_reply(interaction, "すでにリレーが実行中です。")
+
+    waiting_vc_id = get_config_channel_id(interaction.guild.id, "relay_waiting_vc_id", 0)
+    waiting_vc = interaction.guild.get_channel(waiting_vc_id)
+
+    if not isinstance(waiting_vc, discord.VoiceChannel):
+        return await safe_reply(interaction, "`/relay_config` で待機ブースを設定してください。")
+
+    configured_rounds = int(get_config(interaction.guild.id, "relay_rounds", "3"))
+    round_seconds = int(get_config(interaction.guild.id, "relay_round_seconds", "180"))
+    break_seconds = int(get_config(interaction.guild.id, "relay_break_seconds", "30"))
+
+    use_rounds = rounds if rounds is not None else configured_rounds
+    use_rounds = max(1, min(20, use_rounds))
+
+    relay_sessions[interaction.guild.id] = {
+        "running": True,
+        "waiting_vc_id": waiting_vc.id,
+        "rounds": use_rounds,
+        "round_seconds": round_seconds,
+        "break_seconds": break_seconds,
+        "starter_id": interaction.user.id,
+    }
+
+    bot.loop.create_task(run_anonymous_relay_session(interaction.guild, interaction.user.id))
+
+    await safe_reply(
+        interaction,
+        f"匿名個室リレーを開始しました。\n"
+        f"待機ブース: {waiting_vc.mention}\n"
+        f"ラウンド: {use_rounds}\n"
+        f"通話: {round_seconds}秒 / 待機: {break_seconds}秒\n"
+        f"※実行者は待機ブースから移動しません。"
+    )
+
 
 
 bot.run(TOKEN)
