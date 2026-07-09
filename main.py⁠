@@ -57,7 +57,7 @@ status_message_ids = {}
 relay_sessions = {}
 active_recruits = {}
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "bot_data.db")
+DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "bot_data.db"))
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
@@ -216,6 +216,90 @@ def init_db():
             thread_id INTEGER,
             created_at INTEGER NOT NULL,
             PRIMARY KEY (guild_id, user1_id, user2_id)
+        )
+    """)
+
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS economy_balances (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            balance INTEGER DEFAULT 0,
+            total_earned INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS daily_rewards (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            last_claim INTEGER DEFAULT 0,
+            streak INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS shop_items (
+            guild_id INTEGER NOT NULL,
+            item_key TEXT NOT NULL,
+            item_name TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            description TEXT,
+            role_id INTEGER,
+            PRIMARY KEY (guild_id, item_key)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS shop_purchases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            item_key TEXT NOT NULL,
+            purchased_at INTEGER NOT NULL
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS vc_economy_sessions (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            joined_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS economy_tickets (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            ticket_key TEXT NOT NULL,
+            amount INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, user_id, ticket_key)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS economy_events (
+            guild_id INTEGER NOT NULL,
+            event_key TEXT NOT NULL,
+            event_name TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            PRIMARY KEY (guild_id, event_key)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS economy_point_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            reason TEXT,
+            created_at INTEGER NOT NULL
         )
     """)
 
@@ -3342,6 +3426,485 @@ async def anonymous_relay_start(interaction: discord.Interaction, rounds: int | 
         f"通話: {round_seconds}秒 / 待機: {break_seconds}秒\n"
         f"※実行者は待機ブースから移動しません。"
     )
+
+
+
+
+# =========================================================
+# 汎用ポイント・浮上ボーナス・ショップ
+# =========================================================
+
+DEFAULT_TOPICS = [
+    "初デートで行きたい場所は？",
+    "好きな声のタイプは？",
+    "最近ちょっと嬉しかったことは？",
+    "夜に聴きたい曲は？",
+    "理想の休日の過ごし方は？",
+    "通話で言われたら嬉しい一言は？",
+    "夏祭りで絶対食べたいものは？",
+    "落ち着く人ってどんな人？",
+    "最近ハマっているものは？",
+    "寝る前に話すならどんな話題がいい？",
+]
+
+FORTUNES = [
+    ("大吉", "今日は話しかけるほど運気アップ。少しだけ勇気を出してみて。"),
+    ("中吉", "まったりした会話が良い縁につながりそう。"),
+    ("小吉", "聞き役に回ると好印象。無理せず自然体で。"),
+    ("吉", "気になる募集に反応すると良い流れが来るかも。"),
+    ("末吉", "焦らずゆっくり。今日は雰囲気作りが大事。"),
+]
+
+def get_currency_name(guild_id: int):
+    return get_config(guild_id, "currency_name", "Coin")
+
+
+def get_daily_reward_amount(guild_id: int):
+    try:
+        return int(get_config(guild_id, "daily_reward", "50"))
+    except Exception:
+        return 50
+
+
+def get_vc_reward_per_10min(guild_id: int):
+    try:
+        return int(get_config(guild_id, "vc_reward_10min", "10"))
+    except Exception:
+        return 10
+
+
+def ensure_balance(guild_id: int, user_id: int):
+    db.execute(
+        "INSERT OR IGNORE INTO economy_balances (guild_id, user_id) VALUES (?, ?)",
+        (guild_id, user_id),
+    )
+    db.commit()
+
+
+def add_points(guild_id: int, user_id: int, amount: int):
+    if amount <= 0:
+        return
+    ensure_balance(guild_id, user_id)
+    db.execute(
+        """
+        UPDATE economy_balances
+        SET balance = balance + ?, total_earned = total_earned + ?
+        WHERE guild_id=? AND user_id=?
+        """,
+        (amount, amount, guild_id, user_id),
+    )
+    db.commit()
+
+
+def remove_points(guild_id: int, user_id: int, amount: int):
+    ensure_balance(guild_id, user_id)
+    db.execute(
+        """
+        UPDATE economy_balances
+        SET balance = MAX(balance - ?, 0)
+        WHERE guild_id=? AND user_id=?
+        """,
+        (amount, guild_id, user_id),
+    )
+    db.commit()
+
+
+def get_balance(guild_id: int, user_id: int):
+    ensure_balance(guild_id, user_id)
+    cur = db.execute(
+        "SELECT balance, total_earned FROM economy_balances WHERE guild_id=? AND user_id=?",
+        (guild_id, user_id),
+    )
+    row = cur.fetchone()
+    return row if row else (0, 0)
+
+
+def set_default_shop_items(guild_id: int):
+    defaults = [
+        ("boost", "募集ブースト券", 100, "募集を目立たせるための券です。", None),
+        ("tarot_plus", "特別タロット券", 50, "特別な占い演出用の券です。", None),
+        ("profile_deco", "プロフィール装飾券", 150, "匿名プロフィールを飾るための券です。", None),
+    ]
+    for item_key, item_name, price, description, role_id in defaults:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO shop_items
+            (guild_id, item_key, item_name, price, description, role_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (guild_id, item_key, item_name, price, description, role_id),
+        )
+    db.commit()
+
+
+def get_shop_items(guild_id: int):
+    set_default_shop_items(guild_id)
+    cur = db.execute(
+        """
+        SELECT item_key, item_name, price, description, role_id
+        FROM shop_items
+        WHERE guild_id=?
+        ORDER BY price ASC
+        """,
+        (guild_id,),
+    )
+    return cur.fetchall()
+
+
+def get_shop_item(guild_id: int, item_key: str):
+    set_default_shop_items(guild_id)
+    cur = db.execute(
+        """
+        SELECT item_key, item_name, price, description, role_id
+        FROM shop_items
+        WHERE guild_id=? AND item_key=?
+        """,
+        (guild_id, item_key),
+    )
+    return cur.fetchone()
+
+
+@bot.tree.command(name="set_currency_name", description="ポイント名を設定する")
+@app_commands.describe(name="例: Melty Coin / Academy Point")
+async def set_currency_name(interaction: discord.Interaction, name: str):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+    set_config(interaction.guild.id, "currency_name", name[:40])
+    await safe_reply(interaction, f"ポイント名を **{name[:40]}** に設定しました。")
+
+
+@bot.tree.command(name="set_daily_reward", description="毎日浮上ボーナスのポイント量を設定する")
+@app_commands.describe(amount="毎日もらえるポイント")
+async def set_daily_reward(interaction: discord.Interaction, amount: int):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+    amount = max(0, min(10000, amount))
+    set_config(interaction.guild.id, "daily_reward", str(amount))
+    await safe_reply(interaction, f"毎日浮上ボーナスを **{amount}** に設定しました。")
+
+
+@bot.tree.command(name="set_vc_reward", description="VC10分ごとのポイント量を設定する")
+@app_commands.describe(amount="10分ごとのポイント")
+async def set_vc_reward(interaction: discord.Interaction, amount: int):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+    amount = max(0, min(1000, amount))
+    set_config(interaction.guild.id, "vc_reward_10min", str(amount))
+    await safe_reply(interaction, f"VC10分ごとのポイントを **{amount}** に設定しました。")
+
+
+@bot.tree.command(name="grant_points", description="管理者がポイントを付与する")
+@app_commands.describe(member="付与するメンバー", amount="ポイント量")
+async def grant_points(interaction: discord.Interaction, member: discord.Member, amount: int):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+    amount = max(1, min(1000000, amount))
+    add_points(interaction.guild.id, member.id, amount)
+    currency = get_currency_name(interaction.guild.id)
+    await safe_reply(interaction, f"{member.mention} に **{amount} {currency}** を付与しました。")
+
+
+@bot.tree.command(name="points", description="自分のポイントを見る")
+async def points(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    balance, total = get_balance(interaction.guild.id, interaction.user.id)
+    currency = get_currency_name(interaction.guild.id)
+    embed = discord.Embed(title="🪙 ポイント", color=discord.Color.gold())
+    embed.add_field(name="所持", value=f"{balance} {currency}", inline=True)
+    embed.add_field(name="累計獲得", value=f"{total} {currency}", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="浮上", description="毎日1回の浮上ボーナスを受け取る")
+async def daily_bonus(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    guild_id = interaction.guild.id
+    user_id = interaction.user.id
+    now = int(time.time())
+    cur = db.execute(
+        "SELECT last_claim, streak FROM daily_rewards WHERE guild_id=? AND user_id=?",
+        (guild_id, user_id),
+    )
+    row = cur.fetchone()
+    last_claim = int(row[0]) if row else 0
+    streak = int(row[1]) if row else 0
+    if now - last_claim < 86400:
+        remain = 86400 - (now - last_claim)
+        hours = remain // 3600
+        minutes = (remain % 3600) // 60
+        return await safe_reply(interaction, f"今日はもう受け取り済みです。次まで約 {hours}時間{minutes}分。")
+    if last_claim and now - last_claim <= 172800:
+        streak += 1
+    else:
+        streak = 1
+    base = get_daily_reward_amount(guild_id)
+    bonus = min(streak * 2, 100)
+    amount = base + bonus
+    add_points(guild_id, user_id, amount)
+    db.execute(
+        """
+        INSERT INTO daily_rewards (guild_id, user_id, last_claim, streak)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET last_claim=excluded.last_claim, streak=excluded.streak
+        """,
+        (guild_id, user_id, now, streak),
+    )
+    db.commit()
+    fortune, fortune_text = random.choice(FORTUNES)
+    topic = random.choice(DEFAULT_TOPICS)
+    currency = get_currency_name(guild_id)
+    embed = discord.Embed(title="🎁 本日の浮上ボーナス", color=discord.Color.magenta(), timestamp=discord.utils.utcnow())
+    embed.add_field(name="獲得", value=f"+{amount} {currency}", inline=True)
+    embed.add_field(name="連続浮上", value=f"{streak}日目", inline=True)
+    embed.add_field(name="今日の運勢", value=f"**{fortune}**\n{fortune_text}", inline=False)
+    embed.add_field(name="今日のお題", value=topic, inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="shop", description="ショップを見る")
+async def shop(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    currency = get_currency_name(interaction.guild.id)
+    items = get_shop_items(interaction.guild.id)
+    lines = []
+    for item_key, item_name, price, description, role_id in items:
+        role_text = ""
+        role = interaction.guild.get_role(role_id) if role_id else None
+        if role:
+            role_text = f" / 付与ロール: {role.mention}"
+        lines.append(f"`{item_key}` **{item_name}** - {price} {currency}{role_text}\n　{description or '説明なし'}")
+    embed = discord.Embed(title="🛒 ショップ", description="\n\n".join(lines) if lines else "商品がありません。", color=discord.Color.green())
+    embed.set_footer(text="/buy item_key で購入できます。")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="buy", description="ショップの商品を購入する")
+@app_commands.describe(item_key="ショップに表示される item_key")
+async def buy(interaction: discord.Interaction, item_key: str):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    item = get_shop_item(interaction.guild.id, item_key)
+    if not item:
+        return await safe_reply(interaction, "その商品は見つかりません。")
+    _key, item_name, price, description, role_id = item
+    balance, _total = get_balance(interaction.guild.id, interaction.user.id)
+    currency = get_currency_name(interaction.guild.id)
+    if balance < price:
+        return await safe_reply(interaction, f"{currency} が足りません。必要: {price} / 所持: {balance}")
+    remove_points(interaction.guild.id, interaction.user.id, price)
+    db.execute(
+        "INSERT INTO shop_purchases (guild_id, user_id, item_key, purchased_at) VALUES (?, ?, ?, ?)",
+        (interaction.guild.id, interaction.user.id, item_key, int(time.time())),
+    )
+    db.commit()
+    if item_key.startswith("ticket_"):
+        ticket_item_key = item_key.replace("ticket_", "", 1)
+        if "TICKET_DEFINITIONS" in globals() and ticket_item_key in TICKET_DEFINITIONS:
+            add_ticket(interaction.guild.id, interaction.user.id, ticket_item_key, 1)
+    if role_id:
+        role = interaction.guild.get_role(role_id)
+        if role:
+            try:
+                await interaction.user.add_roles(role, reason="ショップ購入")
+            except discord.HTTPException:
+                pass
+    await safe_reply(interaction, f"**{item_name}** を購入しました。-{price} {currency}")
+
+
+@bot.tree.command(name="shop_add", description="ショップ商品を追加・更新する")
+@app_commands.describe(item_key="購入用の短いID 例 boost", item_name="商品名", price="価格", description="説明", role="購入時に付与するロール 任意")
+async def shop_add(interaction: discord.Interaction, item_key: str, item_name: str, price: int, description: str, role: discord.Role | None = None):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+    item_key = item_key.lower()[:40]
+    price = max(0, min(1000000, price))
+    db.execute(
+        """
+        INSERT INTO shop_items
+        (guild_id, item_key, item_name, price, description, role_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id, item_key)
+        DO UPDATE SET item_name=excluded.item_name,
+                      price=excluded.price,
+                      description=excluded.description,
+                      role_id=excluded.role_id
+        """,
+        (interaction.guild.id, item_key, item_name[:80], price, description[:500], role.id if role else None),
+    )
+    db.commit()
+    await safe_reply(interaction, f"ショップ商品 `{item_key}` を保存しました。")
+
+
+@bot.listen("on_voice_state_update")
+async def economy_voice_reward_listener(member: discord.Member, before, after):
+    if member.bot:
+        return
+    try:
+        now = int(time.time())
+        if after.channel and not before.channel:
+            db.execute(
+                """
+                INSERT OR REPLACE INTO vc_economy_sessions
+                (guild_id, user_id, joined_at)
+                VALUES (?, ?, ?)
+                """,
+                (after.channel.guild.id, member.id, now),
+            )
+            db.commit()
+        if before.channel and not after.channel:
+            cur = db.execute(
+                "SELECT joined_at FROM vc_economy_sessions WHERE guild_id=? AND user_id=?",
+                (before.channel.guild.id, member.id),
+            )
+            row = cur.fetchone()
+            if row:
+                humans = [m for m in before.channel.members if not m.bot]
+                min_people = get_vc_reward_min_people(before.channel.guild.id) if "get_vc_reward_min_people" in globals() else 2
+                joined_at = int(row[0])
+                minutes = max(0, (now - joined_at) // 60)
+                units = minutes // 10
+                reward = units * get_vc_reward_per_10min(before.channel.guild.id)
+                if reward > 0 and len(humans) >= min_people:
+                    if "add_points_with_history" in globals():
+                        add_points_with_history(before.channel.guild.id, member.id, reward, "vc_reward")
+                    else:
+                        add_points(before.channel.guild.id, member.id, reward)
+                db.execute(
+                    "DELETE FROM vc_economy_sessions WHERE guild_id=? AND user_id=?",
+                    (before.channel.guild.id, member.id),
+                )
+                db.commit()
+    except Exception:
+        traceback.print_exc()
+
+
+
+
+# =========================================================
+# サーバー別プリセット
+# 𝐦𝐞𝐥𝐭𝐲 𝐌𝐨𝐨𝐧 / puraudhia / 𝕄𝕚𝕕𝕟𝕚𝕘𝕙𝕥 ℕ𝕆𝕀ℝ
+# =========================================================
+
+SERVER_PRESETS = {
+    "melty": {
+        "display_name": "𝐦𝐞𝐥𝐭𝐲 𝐌𝐨𝐨𝐧",
+        "status_name": "今日の 𝐦𝐞𝐥𝐭𝐲 𝐌𝐨𝐨𝐧",
+        "status_message": "今夜はまったり雑談日和です🌙 あなたの一言が、誰かの楽しい夜の始まりになるかも。",
+        "theme": "恋愛",
+        "currency_name": "Melty Coin",
+        "daily_reward": "50",
+        "vc_reward_10min": "10",
+    },
+    "puraudhia": {
+        "display_name": "puraudhia",
+        "status_name": "今日の puraudhia",
+        "status_message": "放課後の談話室へようこそ。気軽に雑談して、今日の思い出を増やしましょう🎓",
+        "theme": "学園",
+        "currency_name": "Academy Point",
+        "daily_reward": "50",
+        "vc_reward_10min": "10",
+    },
+    "midnight": {
+        "display_name": "𝕄𝕚𝕕𝕟𝕚𝕘𝕙𝕥 ℕ𝕆𝕀ℝ",
+        "status_name": "今日の 𝕄𝕚𝕕𝕟𝕚𝕘𝕙𝕥 ℕ𝕆𝕀ℝ",
+        "status_message": "夜更かしさんのための深夜ラウンジ。静かな夜に、少しだけ誰かと話してみませんか🌃",
+        "theme": "深夜",
+        "currency_name": "Noir Coin",
+        "daily_reward": "50",
+        "vc_reward_10min": "10",
+    },
+}
+
+
+def apply_server_preset_values(guild_id: int, preset_key: str):
+    preset = SERVER_PRESETS.get(preset_key)
+    if not preset:
+        return None
+
+    set_config(guild_id, "server_preset", preset_key)
+    set_config(guild_id, "server_display_name", preset["display_name"])
+    set_config(guild_id, "server_status_name", preset["status_name"])
+    set_config(guild_id, "server_status_message", preset["status_message"])
+    set_config(guild_id, "server_status_theme", preset["theme"])
+    set_config(guild_id, "currency_name", preset["currency_name"])
+    set_config(guild_id, "daily_reward", preset["daily_reward"])
+    set_config(guild_id, "vc_reward_10min", preset["vc_reward_10min"])
+
+    return preset
+
+
+@bot.tree.command(name="apply_server_preset", description="サーバー用プリセットを適用する")
+@app_commands.describe(
+    preset="melty / puraudhia / midnight"
+)
+async def apply_server_preset(interaction: discord.Interaction, preset: str):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    preset_key = preset.lower().strip()
+
+    if preset_key not in SERVER_PRESETS:
+        return await safe_reply(
+            interaction,
+            "使えるプリセットは `melty` / `puraudhia` / `midnight` です。"
+        )
+
+    data = apply_server_preset_values(interaction.guild.id, preset_key)
+
+    try:
+        await update_status_panel(interaction.guild)
+    except Exception:
+        pass
+
+    embed = discord.Embed(
+        title="✅ サーバープリセットを適用しました",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="サーバー", value=data["display_name"], inline=False)
+    embed.add_field(name="ダッシュボード名", value=data["status_name"], inline=False)
+    embed.add_field(name="一言", value=data["status_message"], inline=False)
+    embed.add_field(name="テーマ", value=data["theme"], inline=True)
+    embed.add_field(name="ポイント名", value=data["currency_name"], inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="preset_list", description="使えるサーバープリセットを見る")
+async def preset_list(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    lines = []
+    for key, data in SERVER_PRESETS.items():
+        lines.append(
+            f"`{key}` **{data['display_name']}**\n"
+            f"　テーマ: {data['theme']} / ポイント名: {data['currency_name']}"
+        )
+
+    embed = discord.Embed(
+        title="📋 サーバープリセット一覧",
+        description="\n\n".join(lines),
+        color=discord.Color.blurple(),
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 
