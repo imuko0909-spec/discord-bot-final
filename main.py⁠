@@ -3521,9 +3521,13 @@ def get_balance(guild_id: int, user_id: int):
 
 def set_default_shop_items(guild_id: int):
     defaults = [
-        ("boost", "募集ブースト券", 100, "募集を目立たせるための券です。", None),
-        ("tarot_plus", "特別タロット券", 50, "特別な占い演出用の券です。", None),
-        ("profile_deco", "プロフィール装飾券", 150, "匿名プロフィールを飾るための券です。", None),
+        ("ticket_boost", "🎟 募集ブースト券", 100, "次の募集を目立たせる券です。", None),
+        ("ticket_topic_gacha", "🎲 お題ガチャ券", 30, "会話のお題を引ける券です。", None),
+        ("ticket_profile_deco", "🪽 プロフィール装飾券", 150, "匿名プロフィールを装飾できる券です。", None),
+        ("ticket_tarot_plus", "🎴 特別タロット券", 80, "豪華タロットを引ける券です。", None),
+        ("ticket_date_ticket", "💕 デート券", 1000, "デート募集を投稿できる券です。", None),
+        ("ticket_night_date", "🌙 深夜デート券", 1200, "深夜デート募集を投稿できる券です。", None),
+        ("ticket_random_box", "🎁 ランダムBOX", 200, "ランダム報酬BOXです。", None),
     ]
     for item_key, item_name, price, description, role_id in defaults:
         db.execute(
@@ -3773,7 +3777,9 @@ async def economy_voice_reward_listener(member: discord.Member, before, after):
             row = cur.fetchone()
             if row:
                 humans = [m for m in before.channel.members if not m.bot]
-                min_people = get_vc_reward_min_people(before.channel.guild.id) if "get_vc_reward_min_people" in globals() else 2
+                if member not in humans:
+                    humans.append(member)
+                min_people = get_vc_reward_min_people(before.channel.guild.id) if "get_vc_reward_min_people" in globals() else 1
                 joined_at = int(row[0])
                 minutes = max(0, (now - joined_at) // 60)
                 units = minutes // 10
@@ -3808,6 +3814,7 @@ SERVER_PRESETS = {
         "currency_name": "Melty Coin",
         "daily_reward": "50",
         "vc_reward_10min": "10",
+        "vc_reward_min_people": "1",
     },
     "puraudhia": {
         "display_name": "puraudhia",
@@ -3817,6 +3824,7 @@ SERVER_PRESETS = {
         "currency_name": "Academy Point",
         "daily_reward": "50",
         "vc_reward_10min": "10",
+        "vc_reward_min_people": "1",
     },
     "midnight": {
         "display_name": "𝕄𝕚𝕕𝕟𝕚𝕘𝕙𝕥 ℕ𝕆𝕀ℝ",
@@ -3826,6 +3834,7 @@ SERVER_PRESETS = {
         "currency_name": "Noir Coin",
         "daily_reward": "50",
         "vc_reward_10min": "10",
+        "vc_reward_min_people": "1",
     },
 }
 
@@ -3843,6 +3852,7 @@ def apply_server_preset_values(guild_id: int, preset_key: str):
     set_config(guild_id, "currency_name", preset["currency_name"])
     set_config(guild_id, "daily_reward", preset["daily_reward"])
     set_config(guild_id, "vc_reward_10min", preset["vc_reward_10min"])
+    set_config(guild_id, "vc_reward_min_people", preset.get("vc_reward_min_people", "1"))
 
     return preset
 
