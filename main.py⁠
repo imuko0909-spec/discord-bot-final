@@ -56,6 +56,8 @@ room_create_cooldowns = {}
 status_message_ids = {}
 relay_sessions = {}
 active_recruits = {}
+vc_point_tasks = {}
+ticket_private_rooms = {}
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "bot_data.db"))
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -300,6 +302,29 @@ def init_db():
             amount INTEGER NOT NULL,
             reason TEXT,
             created_at INTEGER NOT NULL
+        )
+    """)
+
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS vc_point_live_sessions (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            last_reward_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_private_rooms (
+            guild_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            voice_channel_id INTEGER NOT NULL,
+            text_channel_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, owner_id)
         )
     """)
 
@@ -3519,6 +3544,124 @@ def get_balance(guild_id: int, user_id: int):
     return row if row else (0, 0)
 
 
+
+TICKET_DEFINITIONS = {
+    "boost": ("🎟 募集ブースト券", "注目募集を投稿します"),
+    "special_recruit": ("💌 特別募集券", "豪華な特別募集を投稿します"),
+    "date_ticket": ("💕 デート券", "デート募集を投稿します"),
+    "night_date": ("🌙 深夜デート券", "深夜デート募集を投稿します"),
+    "night_boost": ("🌙 深夜募集ブースト", "深夜の注目募集を投稿します"),
+    "profile_deco": ("🪽 プロフィール装飾券", "匿名プロフィール用の装飾を獲得します"),
+    "tarot_plus": ("🎴 特別タロット券", "特別タロットを引きます"),
+    "topic_gacha": ("🎲 お題ガチャ券", "会話のお題を引きます"),
+    "random_box": ("🎁 ランダムBOX", "ポイントや券をランダム獲得します"),
+    "private_room": ("🔐 専用ルーム券", "専用VCと専用テキストを作成します"),
+}
+
+
+def add_ticket(guild_id: int, user_id: int, ticket_key: str, amount: int = 1):
+    if amount <= 0:
+        return
+    db.execute(
+        """
+        INSERT INTO economy_tickets (guild_id, user_id, ticket_key, amount)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id, ticket_key)
+        DO UPDATE SET amount = economy_tickets.amount + excluded.amount
+        """,
+        (guild_id, user_id, ticket_key, amount),
+    )
+    db.commit()
+
+
+def remove_ticket(guild_id: int, user_id: int, ticket_key: str, amount: int = 1):
+    cur = db.execute(
+        """
+        SELECT amount FROM economy_tickets
+        WHERE guild_id=? AND user_id=? AND ticket_key=?
+        """,
+        (guild_id, user_id, ticket_key),
+    )
+    row = cur.fetchone()
+    if not row or int(row[0]) < amount:
+        return False
+
+    remaining = int(row[0]) - amount
+    if remaining <= 0:
+        db.execute(
+            """
+            DELETE FROM economy_tickets
+            WHERE guild_id=? AND user_id=? AND ticket_key=?
+            """,
+            (guild_id, user_id, ticket_key),
+        )
+    else:
+        db.execute(
+            """
+            UPDATE economy_tickets SET amount=?
+            WHERE guild_id=? AND user_id=? AND ticket_key=?
+            """,
+            (remaining, guild_id, user_id, ticket_key),
+        )
+    db.commit()
+    return True
+
+
+def get_user_tickets(guild_id: int, user_id: int):
+    cur = db.execute(
+        """
+        SELECT ticket_key, amount
+        FROM economy_tickets
+        WHERE guild_id=? AND user_id=? AND amount>0
+        ORDER BY ticket_key
+        """,
+        (guild_id, user_id),
+    )
+    return cur.fetchall()
+
+
+async def get_ticket_recruit_channel(guild: discord.Guild):
+    configured_id = get_config_channel_id(guild.id, "recruit_channel_id", 0)
+    channel = guild.get_channel(configured_id) if configured_id else None
+
+    if not isinstance(channel, discord.TextChannel):
+        channel = discord.utils.get(guild.text_channels, name="雑談募集")
+
+    if not isinstance(channel, discord.TextChannel):
+        channel = await guild.create_text_channel("雑談募集")
+
+    return channel
+
+
+async def post_ticket_recruit(interaction: discord.Interaction, ticket_key: str):
+    channel = await get_ticket_recruit_channel(interaction.guild)
+    voice = interaction.user.voice.channel if interaction.user.voice and interaction.user.voice.channel else None
+
+    settings = {
+        "boost": ("✨ 注目募集", discord.Color.gold(), "通常より目立つ注目募集です。"),
+        "special_recruit": ("💌 特別募集", discord.Color.gold(), "本日の特別募集です。"),
+        "date_ticket": ("💕 デート募集", discord.Color.magenta(), "まったり二人で話せる相手を募集しています。"),
+        "night_date": ("🌙 深夜デート募集", discord.Color.dark_purple(), "夜更かしさん同士で静かにお話しませんか？"),
+        "night_boost": ("🌙 深夜注目募集", discord.Color.purple(), "深夜組向けの注目募集です。"),
+    }
+    title, color, text = settings[ticket_key]
+
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"👤 募集主：{interaction.user.mention}\n"
+            f"🎙 VC：{voice.mention if voice else 'VC未参加'}\n\n"
+            f"{text}\n"
+            "気になる方はVCへ直接参加してください✨"
+        ),
+        color=color,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text=f"募集主：{interaction.user.display_name}")
+    await channel.send(embed=embed)
+
+
+
 def set_default_shop_items(guild_id: int):
     defaults = [
         ("ticket_boost", "🎟 募集ブースト券", 100, "次の募集を目立たせる券です。", None),
@@ -3528,6 +3671,7 @@ def set_default_shop_items(guild_id: int):
         ("ticket_date_ticket", "💕 デート券", 1000, "デート募集を投稿できる券です。", None),
         ("ticket_night_date", "🌙 深夜デート券", 1200, "深夜デート募集を投稿できる券です。", None),
         ("ticket_random_box", "🎁 ランダムBOX", 200, "ランダム報酬BOXです。", None),
+        ("ticket_private_room", "🔐 専用ルーム券", 800, "専用VCと専用テキストを作成できる券です。", None),
     ]
     for item_key, item_name, price, description, role_id in defaults:
         db.execute(
@@ -3694,37 +3838,251 @@ async def shop(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+
 @bot.tree.command(name="buy", description="ショップの商品を購入する")
-@app_commands.describe(item_key="ショップに表示される item_key")
+@app_commands.describe(item_key="ショップに表示される商品ID")
 async def buy(interaction: discord.Interaction, item_key: str):
     if interaction.guild is None:
         return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    item_key = item_key.lower().strip()
     item = get_shop_item(interaction.guild.id, item_key)
     if not item:
         return await safe_reply(interaction, "その商品は見つかりません。")
+
     _key, item_name, price, description, role_id = item
     balance, _total = get_balance(interaction.guild.id, interaction.user.id)
     currency = get_currency_name(interaction.guild.id)
+
     if balance < price:
-        return await safe_reply(interaction, f"{currency} が足りません。必要: {price} / 所持: {balance}")
-    remove_points(interaction.guild.id, interaction.user.id, price)
-    db.execute(
-        "INSERT INTO shop_purchases (guild_id, user_id, item_key, purchased_at) VALUES (?, ?, ?, ?)",
-        (interaction.guild.id, interaction.user.id, item_key, int(time.time())),
-    )
-    db.commit()
+        return await safe_reply(
+            interaction,
+            f"{currency} が足りません。必要：{price} / 所持：{balance}",
+        )
+
+    ticket_key = None
     if item_key.startswith("ticket_"):
-        ticket_item_key = item_key.replace("ticket_", "", 1)
-        if "TICKET_DEFINITIONS" in globals() and ticket_item_key in TICKET_DEFINITIONS:
-            add_ticket(interaction.guild.id, interaction.user.id, ticket_item_key, 1)
+        ticket_key = item_key.removeprefix("ticket_")
+        if ticket_key not in TICKET_DEFINITIONS:
+            return await safe_reply(
+                interaction,
+                "この商品は使用効果が未登録です。管理者に確認してください。",
+            )
+
+    remove_points(interaction.guild.id, interaction.user.id, price)
+
+    if ticket_key:
+        add_ticket(interaction.guild.id, interaction.user.id, ticket_key, 1)
+
     if role_id:
         role = interaction.guild.get_role(role_id)
         if role:
             try:
                 await interaction.user.add_roles(role, reason="ショップ購入")
-            except discord.HTTPException:
-                pass
-    await safe_reply(interaction, f"**{item_name}** を購入しました。-{price} {currency}")
+            except discord.Forbidden:
+                add_points(interaction.guild.id, interaction.user.id, price)
+                return await safe_reply(
+                    interaction,
+                    "ロールを付与できませんでした。Botのロールを商品ロールより上へ移動してください。",
+                )
+
+    db.execute(
+        """
+        INSERT INTO shop_purchases
+        (guild_id, user_id, item_key, purchased_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (interaction.guild.id, interaction.user.id, item_key, int(time.time())),
+    )
+    db.commit()
+
+    extra = ""
+    if ticket_key:
+        extra = f"\n所持品に追加しました。`/inventory` で確認できます。"
+
+    await safe_reply(
+        interaction,
+        f"**{item_name}** を購入しました！\n-{price} {currency}{extra}",
+    )
+
+
+@bot.tree.command(name="inventory", description="所持ポイントとチケット一覧を見る")
+async def inventory(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    balance, _total = get_balance(interaction.guild.id, interaction.user.id)
+    currency = get_currency_name(interaction.guild.id)
+    rows = get_user_tickets(interaction.guild.id, interaction.user.id)
+
+    embed = discord.Embed(
+        title="🎒 所持品",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="🪙 所持ポイント",
+        value=f"**{balance} {currency}**",
+        inline=False,
+    )
+
+    if rows:
+        lines = []
+        for ticket_key, amount in rows:
+            name, description = TICKET_DEFINITIONS.get(
+                ticket_key,
+                (ticket_key, "説明なし"),
+            )
+            lines.append(
+                f"{name} × **{amount}**\n"
+                f"商品ID：`{ticket_key}`\n"
+                f"{description}"
+            )
+        embed.add_field(
+            name="🎟 所持チケット",
+            value="\n\n".join(lines),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="🎟 所持チケット",
+            value="現在、所持しているチケットはありません。",
+            inline=False,
+        )
+
+    embed.set_footer(text="/use_ticket でチケットを使用できます。")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="tickets", description="所持チケット一覧を見る")
+async def tickets(interaction: discord.Interaction):
+    await inventory(interaction)
+
+
+@bot.tree.command(name="use_ticket", description="所持しているチケットを使用する")
+@app_commands.describe(ticket_key="使用するチケットの商品ID")
+async def use_ticket(interaction: discord.Interaction, ticket_key: str):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    ticket_key = ticket_key.lower().strip()
+    if ticket_key not in TICKET_DEFINITIONS:
+        return await safe_reply(
+            interaction,
+            "使用できるID：\n`boost` `special_recruit` `date_ticket` "
+            "`night_date` `night_boost` `profile_deco` "
+            "`tarot_plus` `topic_gacha` `random_box` `private_room`",
+        )
+
+    if not remove_ticket(
+        interaction.guild.id,
+        interaction.user.id,
+        ticket_key,
+        1,
+    ):
+        return await safe_reply(interaction, "そのチケットを持っていません。")
+
+    try:
+        if ticket_key in {
+            "boost",
+            "special_recruit",
+            "date_ticket",
+            "night_date",
+            "night_boost",
+        }:
+            await post_ticket_recruit(interaction, ticket_key)
+            return await safe_reply(interaction, "チケットを使用して募集を投稿しました！")
+
+
+        if ticket_key == "private_room":
+            created, error = await create_private_room_from_ticket(interaction)
+
+            if error:
+                add_ticket(
+                    interaction.guild.id,
+                    interaction.user.id,
+                    "private_room",
+                    1,
+                )
+                return await safe_reply(interaction, error)
+
+            voice, text = created
+            return await safe_reply(
+                interaction,
+                f"専用ルームを作成しました！\n"
+                f"🎙 {voice.mention}\n"
+                f"💬 {text.mention}",
+            )
+
+        if ticket_key == "topic_gacha":
+            topics = [
+                "初デートで行きたい場所は？",
+                "理想の休日の過ごし方は？",
+                "最近いちばん嬉しかったことは？",
+                "好きな声や話し方のタイプは？",
+                "夜にゆっくり話したい話題は？",
+                "旅行するなら海と山、どちら？",
+                "子どもの頃に好きだったものは？",
+            ]
+            embed = discord.Embed(
+                title="🎲 お題ガチャ",
+                description=random.choice(topics),
+                color=discord.Color.blurple(),
+            )
+            return await interaction.response.send_message(embed=embed)
+
+        if ticket_key == "tarot_plus":
+            cards = [
+                ("恋人", "気持ちが通じやすい日。素直な会話を大切に。"),
+                ("星", "希望が見える日。焦らず自然体で。"),
+                ("太陽", "明るい交流が良い縁を運びそう。"),
+                ("運命の輪", "思いがけない会話が転機になるかも。"),
+                ("女帝", "優しさと包容力が魅力として伝わる日。"),
+            ]
+            card, message = random.choice(cards)
+            embed = discord.Embed(
+                title="🎴 特別タロット",
+                color=discord.Color.gold(),
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.add_field(name="カード", value=f"**{card}**", inline=False)
+            embed.add_field(name="メッセージ", value=message, inline=False)
+            return await interaction.response.send_message(embed=embed)
+
+        if ticket_key == "profile_deco":
+            decoration = random.choice(["🌸", "💎", "👑", "✨", "🪽", "🌙", "💕", "🖤"])
+            return await safe_reply(
+                interaction,
+                f"プロフィール装飾 **{decoration}** を獲得しました！",
+            )
+
+        if ticket_key == "random_box":
+            reward = random.choice([
+                ("points", 30, "30ポイント"),
+                ("points", 80, "80ポイント"),
+                ("ticket", "boost", "募集ブースト券"),
+                ("ticket", "topic_gacha", "お題ガチャ券"),
+                ("ticket", "tarot_plus", "特別タロット券"),
+                ("ticket", "date_ticket", "デート券"),
+            ])
+
+            if reward[0] == "points":
+                add_points(interaction.guild.id, interaction.user.id, reward[1])
+            else:
+                add_ticket(interaction.guild.id, interaction.user.id, reward[1], 1)
+
+            return await safe_reply(
+                interaction,
+                f"🎁 BOXを開封！ **{reward[2]}** を獲得しました。",
+            )
+
+    except Exception:
+        # エラー時は券を返却
+        add_ticket(interaction.guild.id, interaction.user.id, ticket_key, 1)
+        traceback.print_exc()
+        return await safe_reply(
+            interaction,
+            "使用中にエラーが起きたため、チケットを返却しました。",
+        )
 
 
 @bot.tree.command(name="shop_add", description="ショップ商品を追加・更新する")
@@ -3753,8 +4111,7 @@ async def shop_add(interaction: discord.Interaction, item_key: str, item_name: s
     await safe_reply(interaction, f"ショップ商品 `{item_key}` を保存しました。")
 
 
-@bot.listen("on_voice_state_update")
-async def economy_voice_reward_listener(member: discord.Member, before, after):
+async def legacy_economy_voice_reward_listener(member: discord.Member, before, after):
     if member.bot:
         return
     try:
@@ -3797,6 +4154,422 @@ async def economy_voice_reward_listener(member: discord.Member, before, after):
     except Exception:
         traceback.print_exc()
 
+
+
+
+
+
+# =========================================================
+# 専用ルーム券
+# =========================================================
+
+def get_private_room_record(guild_id: int, owner_id: int):
+    cur = db.execute(
+        """
+        SELECT voice_channel_id, text_channel_id
+        FROM ticket_private_rooms
+        WHERE guild_id=? AND owner_id=?
+        """,
+        (guild_id, owner_id),
+    )
+    return cur.fetchone()
+
+
+def save_private_room_record(
+    guild_id: int,
+    owner_id: int,
+    voice_id: int,
+    text_id: int,
+):
+    db.execute(
+        """
+        INSERT OR REPLACE INTO ticket_private_rooms
+        (guild_id, owner_id, voice_channel_id, text_channel_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (guild_id, owner_id, voice_id, text_id, int(time.time())),
+    )
+    db.commit()
+
+
+def delete_private_room_record(guild_id: int, owner_id: int):
+    db.execute(
+        "DELETE FROM ticket_private_rooms WHERE guild_id=? AND owner_id=?",
+        (guild_id, owner_id),
+    )
+    db.commit()
+
+
+async def get_or_create_private_room_category(guild: discord.Guild):
+    category_id = get_config_channel_id(guild.id, "private_room_category_id", 0)
+    category = guild.get_channel(category_id) if category_id else None
+
+    if isinstance(category, discord.CategoryChannel):
+        return category
+
+    category = discord.utils.get(guild.categories, name="専用ルーム")
+    if isinstance(category, discord.CategoryChannel):
+        set_config(guild.id, "private_room_category_id", str(category.id))
+        return category
+
+    category = await guild.create_category(
+        "専用ルーム",
+        reason="専用ルーム券用カテゴリー",
+    )
+    set_config(guild.id, "private_room_category_id", str(category.id))
+    return category
+
+
+async def create_private_room_from_ticket(
+    interaction: discord.Interaction,
+):
+    guild = interaction.guild
+    owner = interaction.user
+
+    existing = get_private_room_record(guild.id, owner.id)
+    if existing:
+        voice = guild.get_channel(existing[0])
+        text = guild.get_channel(existing[1])
+        if voice or text:
+            return None, "すでに専用ルームを持っています。"
+        delete_private_room_record(guild.id, owner.id)
+
+    category = await get_or_create_private_room_category(guild)
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=False,
+            connect=False,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            move_members=True,
+        ),
+        owner: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            send_messages=True,
+            read_message_history=True,
+        ),
+    }
+
+    voice = await guild.create_voice_channel(
+        name=f"🔐｜{owner.display_name}専用",
+        category=category,
+        overwrites=overwrites,
+        reason="専用ルーム券使用",
+    )
+
+    text = await guild.create_text_channel(
+        name=f"🔐-{owner.display_name}-専用",
+        category=category,
+        overwrites=overwrites,
+        topic=f"{owner.display_name}さんの専用ルーム",
+        reason="専用ルーム券使用",
+    )
+
+    save_private_room_record(guild.id, owner.id, voice.id, text.id)
+    ticket_private_rooms[(guild.id, owner.id)] = {
+        "voice_id": voice.id,
+        "text_id": text.id,
+    }
+
+    embed = discord.Embed(
+        title="🔐 専用ルームを作成しました",
+        description=(
+            f"🎙 {voice.mention}\n"
+            f"💬 {text.mention}\n\n"
+            "`/専用ルーム招待` でメンバーを招待できます。\n"
+            "`/専用ルーム終了` で削除できます。"
+        ),
+        color=discord.Color.gold(),
+    )
+    await text.send(owner.mention, embed=embed)
+
+    return (voice, text), None
+
+
+async def delete_private_room(
+    guild: discord.Guild,
+    owner_id: int,
+):
+    data = get_private_room_record(guild.id, owner_id)
+    if not data:
+        return False
+
+    voice = guild.get_channel(data[0])
+    text = guild.get_channel(data[1])
+
+    if isinstance(text, discord.TextChannel):
+        try:
+            await text.delete(reason="専用ルーム終了")
+        except discord.HTTPException:
+            pass
+
+    if isinstance(voice, discord.VoiceChannel):
+        try:
+            await voice.delete(reason="専用ルーム終了")
+        except discord.HTTPException:
+            pass
+
+    delete_private_room_record(guild.id, owner_id)
+    ticket_private_rooms.pop((guild.id, owner_id), None)
+    return True
+
+
+@bot.tree.command(name="専用ルーム招待", description="専用ルームへメンバーを招待する")
+@app_commands.describe(member="招待するメンバー")
+async def private_room_invite(
+    interaction: discord.Interaction,
+    member: discord.Member,
+):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    data = get_private_room_record(interaction.guild.id, interaction.user.id)
+    if not data:
+        return await safe_reply(interaction, "専用ルームを持っていません。")
+
+    voice = interaction.guild.get_channel(data[0])
+    text = interaction.guild.get_channel(data[1])
+
+    overwrite = discord.PermissionOverwrite(
+        view_channel=True,
+        connect=True,
+        speak=True,
+        send_messages=True,
+        read_message_history=True,
+    )
+
+    try:
+        if isinstance(voice, discord.VoiceChannel):
+            await voice.set_permissions(member, overwrite=overwrite)
+        if isinstance(text, discord.TextChannel):
+            await text.set_permissions(member, overwrite=overwrite)
+            await text.send(f"{member.mention} さんが招待されました。")
+        await safe_reply(interaction, f"{member.mention} を招待しました。")
+    except discord.Forbidden:
+        await safe_reply(
+            interaction,
+            "Botにチャンネル管理権限を付けてください。",
+        )
+
+
+@bot.tree.command(name="専用ルーム退出", description="専用ルームからメンバーを外す")
+@app_commands.describe(member="外すメンバー")
+async def private_room_remove(
+    interaction: discord.Interaction,
+    member: discord.Member,
+):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    data = get_private_room_record(interaction.guild.id, interaction.user.id)
+    if not data:
+        return await safe_reply(interaction, "専用ルームを持っていません。")
+
+    voice = interaction.guild.get_channel(data[0])
+    text = interaction.guild.get_channel(data[1])
+
+    if isinstance(voice, discord.VoiceChannel):
+        await voice.set_permissions(member, overwrite=None)
+        if member.voice and member.voice.channel == voice:
+            try:
+                await member.move_to(None)
+            except discord.HTTPException:
+                pass
+
+    if isinstance(text, discord.TextChannel):
+        await text.set_permissions(member, overwrite=None)
+
+    await safe_reply(interaction, f"{member.mention} を専用ルームから外しました。")
+
+
+@bot.tree.command(name="専用ルーム終了", description="自分の専用ルームを削除する")
+async def private_room_end(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    deleted = await delete_private_room(
+        interaction.guild,
+        interaction.user.id,
+    )
+
+    if deleted:
+        await safe_reply(interaction, "専用ルームを終了しました。")
+    else:
+        await safe_reply(interaction, "専用ルームを持っていません。")
+
+
+@bot.tree.command(name="set_private_room_category", description="専用ルーム作成カテゴリーを設定する")
+@app_commands.describe(category="専用ルームを作るカテゴリー")
+async def set_private_room_category(
+    interaction: discord.Interaction,
+    category: discord.CategoryChannel,
+):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    set_config(
+        interaction.guild.id,
+        "private_room_category_id",
+        str(category.id),
+    )
+    await safe_reply(
+        interaction,
+        f"専用ルームカテゴリーを **{category.name}** に設定しました。",
+    )
+
+
+
+# =========================================================
+# VCポイント：全VC・1人から・滞在中10分ごと
+# =========================================================
+
+def get_vc_reward_min_people(guild_id: int):
+    try:
+        return int(get_config(guild_id, "vc_reward_min_people", "1"))
+    except Exception:
+        return 1
+
+
+async def vc_point_reward_loop(guild_id: int, user_id: int):
+    await bot.wait_until_ready()
+    key = (guild_id, user_id)
+
+    try:
+        while not bot.is_closed():
+            guild = bot.get_guild(guild_id)
+            member = guild.get_member(user_id) if guild else None
+
+            if not member or not member.voice or not member.voice.channel:
+                break
+
+            channel = member.voice.channel
+            humans = [m for m in channel.members if not m.bot]
+            minimum = get_vc_reward_min_people(guild_id)
+
+            now = int(time.time())
+            cur = db.execute(
+                """
+                SELECT last_reward_at
+                FROM vc_point_live_sessions
+                WHERE guild_id=? AND user_id=?
+                """,
+                (guild_id, user_id),
+            )
+            row = cur.fetchone()
+
+            if not row:
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO vc_point_live_sessions
+                    (guild_id, user_id, channel_id, last_reward_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (guild_id, user_id, channel.id, now),
+                )
+                db.commit()
+                last_reward = now
+            else:
+                last_reward = int(row[0])
+
+            if now - last_reward >= 600:
+                reward = get_vc_reward_per_10min(guild_id)
+
+                if reward > 0 and len(humans) >= minimum:
+                    add_points(guild_id, user_id, reward)
+
+                db.execute(
+                    """
+                    UPDATE vc_point_live_sessions
+                    SET channel_id=?, last_reward_at=?
+                    WHERE guild_id=? AND user_id=?
+                    """,
+                    (channel.id, now, guild_id, user_id),
+                )
+                db.commit()
+
+            await asyncio.sleep(30)
+
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        traceback.print_exc()
+    finally:
+        db.execute(
+            """
+            DELETE FROM vc_point_live_sessions
+            WHERE guild_id=? AND user_id=?
+            """,
+            (guild_id, user_id),
+        )
+        db.commit()
+        vc_point_tasks.pop(key, None)
+
+
+def start_vc_point_task(member: discord.Member):
+    if member.bot or not member.voice or not member.voice.channel:
+        return
+
+    key = (member.guild.id, member.id)
+    task = vc_point_tasks.get(key)
+
+    if task and not task.done():
+        return
+
+    vc_point_tasks[key] = bot.loop.create_task(
+        vc_point_reward_loop(member.guild.id, member.id)
+    )
+
+
+def stop_vc_point_task(member: discord.Member):
+    key = (member.guild.id, member.id)
+    task = vc_point_tasks.get(key)
+
+    if task and not task.done():
+        task.cancel()
+
+
+@bot.listen("on_voice_state_update")
+async def vc_point_state_listener(member: discord.Member, before, after):
+    if member.bot:
+        return
+
+    if after.channel:
+        start_vc_point_task(member)
+
+    if before.channel and not after.channel:
+        stop_vc_point_task(member)
+
+
+@bot.tree.command(name="set_vc_reward_min_people", description="VCポイントの最低人数を設定する")
+@app_commands.describe(amount="1なら1人でもポイント付与")
+async def set_vc_reward_min_people_command(
+    interaction: discord.Interaction,
+    amount: int,
+):
+    if interaction.guild is None:
+        return await safe_reply(interaction, "サーバー内で使ってください。")
+
+    if not admin_config_check(interaction):
+        return await safe_reply(interaction, "管理者だけ使用できます。")
+
+    amount = max(1, min(20, amount))
+    set_config(interaction.guild.id, "vc_reward_min_people", str(amount))
+
+    await safe_reply(
+        interaction,
+        f"VCポイントの最低人数を **{amount}人** に設定しました。",
+    )
 
 
 
